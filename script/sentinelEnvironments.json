@@ -1,14 +1,14 @@
-[
-  {
-    "subscriptionId": "69e238c0-023f-455f-8432-013a258cf548",
-    "resourceGroupName": "3psiem",
-    "workspaceName": "danh4"
-  }
-  // Additional environments can be added by copying the template below
-  // ,
-  // {
-  //   "subscriptionId": "<your-subscription-id>",
-  //   "resourceGroupName": "<your-resource-group-name>",
-  //   "workspaceName": "<your-workspace-name>"
-  // }
-]
+{
+  "credentials": {
+    "tenantId": "66a5c282-92a6-49d5-9532-3d72398a4cf9",
+    "clientId": "0221556f-c768-44f5-847b-47b00751037b",
+    "clientSecret": "XXXX"
+  },
+  "environments": [
+    {
+      "subscriptionId": "69e238c0-023f-455f-8432-013a258cf548",
+      "resourceGroupName": "3psiem",
+      "workspaceName": "danh4"
+    }
+  ]
+}
