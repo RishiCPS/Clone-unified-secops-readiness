@@ -860,13 +860,40 @@ Write-Host ""
 
 # Define your Entra App Registration and Sentinel details
 
-$tenantId = "66a5c282-92a6-49d5-9532-3d72398a4cf9"
-$clientId = "0221556f-c768-44f5-847b-47b00751037b"
-$clientSecret = "XXXXX"
+$tenantId = $null
+$clientId = $null
+$clientSecret = $null
+$environments = @()
 
-# Read environments from JSON file
+# Read environments and credentials from JSON file
 if ($EnvironmentsFile) {
-    $environments = Get-Content $EnvironmentsFile | ConvertFrom-Json
+    $configContent = Get-Content -Path $EnvironmentsFile -Raw
+    if (-not $configContent) {
+        throw "The environments file '$EnvironmentsFile' is empty."
+    }
+
+    $config = $configContent | ConvertFrom-Json
+
+    if (-not $config.credentials) {
+        throw "The environments file must contain a 'credentials' object with tenantId, clientId, and clientSecret."
+    }
+
+    $tenantId = $config.credentials.tenantId
+    $clientId = $config.credentials.clientId
+    $clientSecret = $config.credentials.clientSecret
+
+    if (-not $tenantId -or -not $clientId -or -not $clientSecret) {
+        throw "The credentials in '$EnvironmentsFile' must include tenantId, clientId, and clientSecret values."
+    }
+
+    if ($config.environments) {
+        $environments = $config.environments
+    }
+
+    if (-not $environments -or $environments.Count -eq 0) {
+        throw "No environments were found in the '$EnvironmentsFile' file. Ensure an 'environments' array is defined."
+    }
+
     write-Host "$($environments.Count) environments found in the $EnvironmentsFile file" -ForegroundColor Green
     write-Host "Environments loaded from file:" -ForegroundColor Green
     $environments | ForEach-Object {
@@ -874,13 +901,7 @@ if ($EnvironmentsFile) {
     }
 }
 else {
-    $environments = @(
-        @{
-            subscriptionId    = $subscriptionId
-            resourceGroupName = $resourceGroupName
-            workspaceName     = $workspaceName
-        }
-    )
+    throw "The EnvironmentsFile parameter is required so that credentials and environments can be loaded."
 }
 
 $resource = "https://management.azure.com/"
