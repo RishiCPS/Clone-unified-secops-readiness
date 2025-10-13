@@ -135,6 +135,11 @@ function Save-ReportAndCleanup {
     }
     $savePath = Join-Path $scriptDir $finalName
 
+    if ($script:scriptStopwatch) {
+        $totalElapsed = $script:scriptStopwatch.Elapsed
+        Write-Host ("Total script runtime: {0:hh\:mm\:ss}" -f $totalElapsed) -ForegroundColor Cyan
+    }
+
     try {
         $Document.SaveAs2([string]$savePath, [ref]$wdFormat)
         Write-Host "Report generated on" (Get-Date -Format "yyyy-MM-dd")
@@ -162,10 +167,22 @@ function Get-AnalysisDefenderData {
         $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/tables/${table}?api-version=$apiVersion"
         $response = Invoke-SentinelApi -Uri $uri
         $retentionPeriod = $response.properties.totalRetentionInDays
+        $plan = $response.properties.plan
+        if ($plan) {
+            if ($plan -is [string]) {
+                $planDisplay = $plan
+            }
+            else {
+                $planDisplay = ($plan | ConvertTo-Json -Compress)
+            }
+        }
+        else {
+            $planDisplay = 'Unknown'
+        }
         $totalControlsTemp = $totalControlsTemp + 1
 
         if ($response.properties.totalRetentionInDays -lt 31) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The table $table has a retention of $retentionPeriod days - no need to ingest this data in Sentinel" 
+            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionPeriod days - no need to ingest this data in Sentinel"
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
                 $Writer.TypeText("[WARNING] ")
@@ -175,12 +192,12 @@ function Get-AnalysisDefenderData {
                 $Writer.TypeText($table)
                 Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
                 $Writer.Font.Bold = $false
-                $Writer.TypeText(" has a retention of $retentionPeriod days - no need to ingest this data in Sentinel")
+                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionPeriod days - no need to ingest this data in Sentinel")
                 $Writer.TypeParagraph()
             }
         }
         else {
-            Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The table $table has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention" 
+            Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention"
             $passedControlsTemp = $passedControlsTemp + 1
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 5287936 -Bold $true
@@ -190,7 +207,7 @@ function Get-AnalysisDefenderData {
                 Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
                 $Writer.TypeText($table)
                 Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
-                $Writer.TypeText(" has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention")
+                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention")
                 $Writer.TypeParagraph()
             }
         }
@@ -900,6 +917,9 @@ if ($EnvironmentsFile) {
         write-Host "   - $($_.workspaceName) in subscription $($_.subscriptionId) and resource group $($_.resourceGroupName)"  -ForegroundColor Green
     }
 }
+else {
+    throw "The EnvironmentsFile parameter is required so that credentials and environments can be loaded."
+}
 
 $script:accessToken = $null
 $script:tokenExpiresAt = Get-Date -Date '1970-01-01T00:00:00Z'
@@ -967,38 +987,64 @@ function Invoke-SentinelApi {
         [hashtable]$AdditionalHeaders = $null
     )
 
-    Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
+    $maxAttempts = 2
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
 
-    $effectiveHeaders = @{}
-    foreach ($item in $script:header.GetEnumerator()) {
-        $effectiveHeaders[$item.Key] = $item.Value
-    }
-
-    if ($AdditionalHeaders) {
-        foreach ($item in $AdditionalHeaders.GetEnumerator()) {
+        $effectiveHeaders = @{}
+        foreach ($item in $script:header.GetEnumerator()) {
             $effectiveHeaders[$item.Key] = $item.Value
         }
-    }
 
-    $elapsed = $script:scriptStopwatch.Elapsed
-    Write-Host ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri) -ForegroundColor Yellow
+        if ($AdditionalHeaders) {
+            foreach ($item in $AdditionalHeaders.GetEnumerator()) {
+                $effectiveHeaders[$item.Key] = $item.Value
+            }
+        }
 
-    try {
-        if ($null -ne $Body) {
-            return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders -Body $Body
+        $elapsed = $script:scriptStopwatch.Elapsed
+        Write-Host ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri) -ForegroundColor Yellow
+
+        try {
+            if ($null -ne $Body) {
+                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders -Body $Body
+            }
+            else {
+                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders
+            }
         }
-        else {
-            return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders
+        catch {
+            $errorElapsed = $script:scriptStopwatch.Elapsed
+            $statusCode = $null
+            if ($_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
+                try {
+                    $statusCode = [int]$_.Exception.Response.StatusCode.Value__
+                }
+                catch {
+                    $statusCode = $null
+                }
+            }
+
+            $shouldRetry = $false
+            if ($statusCode -eq 401 -and $attempt -lt $maxAttempts -and $script:authUrl -and $script:tokenRequestBody) {
+                Write-Host ("[{0:hh\:mm\:ss}] Access token expired. Requesting a new token." -f $errorElapsed) -ForegroundColor DarkYellow
+                Request-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
+                $shouldRetry = $true
+            }
+            elseif ($_.Exception.Message -match 'token' -and $_.Exception.Message -match 'expired' -and $attempt -lt $maxAttempts -and $script:authUrl -and $script:tokenRequestBody) {
+                Write-Host ("[{0:hh\:mm\:ss}] Token reported as expired. Requesting a new token." -f $errorElapsed) -ForegroundColor DarkYellow
+                Request-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
+                $shouldRetry = $true
+            }
+
+            if ($shouldRetry) {
+                continue
+            }
+
+            Write-Host ("[{0:hh\:mm\:ss}] ERROR during {1} {2}: {3}" -f $errorElapsed, $Method.ToUpper(), $Uri, $_.Exception.Message) -ForegroundColor Red
+            throw
         }
     }
-    catch {
-        $errorElapsed = $script:scriptStopwatch.Elapsed
-        Write-Host ("[{0:hh\:mm\:ss}] ERROR during {1} {2}: {3}" -f $errorElapsed, $Method.ToUpper(), $Uri, $_.Exception.Message) -ForegroundColor Red
-        throw
-    }
-}
-else {
-    throw "The EnvironmentsFile parameter is required so that credentials and environments can be loaded."
 }
 
 $resource = "https://management.azure.com/"
@@ -1257,4 +1303,8 @@ if ($reportRequested) {
     $Document.TablesOfContents.Item(1).Update()
     Save-ReportAndCleanup -FileName $FileName -Document $Document -WordApplication $WordApplication -Format $Format
 
+}
+elseif ($script:scriptStopwatch) {
+    $finalElapsed = $script:scriptStopwatch.Elapsed
+    Write-Host ("Total script runtime: {0:hh\:mm\:ss}" -f $finalElapsed) -ForegroundColor Cyan
 }
