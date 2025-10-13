@@ -22,6 +22,128 @@ param(
     [string]$Format = $null
 )
 
+
+class NullWordFont {
+    [int]$Color
+    [bool]$Bold
+    [bool]$Italic
+    NullWordFont() {
+        $this.Color = 0
+        $this.Bold = $false
+        $this.Italic = $false
+    }
+}
+
+class NullWordListFormat {
+    [void]ApplyBulletDefault() {}
+    [void]RemoveNumbers() {}
+}
+
+class NullWordRange {
+    [NullWordListFormat]$ListFormat
+    NullWordRange() {
+        $this.ListFormat = [NullWordListFormat]::new()
+    }
+}
+
+class NullWordSelection {
+    [string]$Style
+    [NullWordFont]$Font
+    [NullWordRange]$Range
+    NullWordSelection() {
+        $this.Font = [NullWordFont]::new()
+        $this.Range = [NullWordRange]::new()
+    }
+    [void]TypeText([object]$Text) {}
+    [void]TypeParagraph() {}
+    [void]InsertBreak([int]$Type) {}
+    [void]HomeKey([int]$Unit) {}
+    [void]Paste() {}
+}
+
+$script:wordAutomationDisabled = $false
+$script:reportWasRequested = $false
+Set-Variable -Scope Script -Name WordApplication -Value $null
+Set-Variable -Scope Script -Name Document -Value $null
+Set-Variable -Scope Script -Name Writer -Value ([NullWordSelection]::new())
+
+function Disable-WordReport {
+    param(
+        [string]$Reason,
+        [System.Exception]$Exception = $null
+    )
+
+    if ($script:wordAutomationDisabled) {
+        return
+    }
+
+    $script:wordAutomationDisabled = $true
+    Set-Variable -Scope Script -Name reportRequested -Value $false
+
+    if (-not $Reason -and $Exception) {
+        $Reason = "Word automation failed: $($Exception.Message)"
+    }
+
+    if ($script:reportWasRequested -and $Reason) {
+        Write-Warning $Reason
+    }
+
+    try {
+        if ($script:WordApplication) {
+            $script:WordApplication.Quit()
+        }
+    }
+    catch {
+    }
+    finally {
+        if ($script:Document) {
+            try {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($script:Document) | Out-Null
+            }
+            catch {
+            }
+        }
+        if ($script:WordApplication) {
+            try {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($script:WordApplication) | Out-Null
+            }
+            catch {
+            }
+        }
+        $script:Document = $null
+        $script:WordApplication = $null
+    }
+
+    Set-Variable -Scope Script -Name Writer -Value ([NullWordSelection]::new())
+}
+
+function Should-WriteReport {
+    if (-not $reportRequested) {
+        return $false
+    }
+    if ($script:wordAutomationDisabled) {
+        return $false
+    }
+    return $true
+}
+
+trap [System.Runtime.InteropServices.COMException] {
+    if ($_.Exception.HResult -eq -2147023174) {
+        Disable-WordReport -Reason "Word automation became unavailable (RPC server is unavailable). Report generation will continue without the Word document." -Exception $_.Exception
+        continue
+    }
+    throw
+}
+
+trap [System.Management.Automation.RuntimeException] {
+    $message = $_.Exception.Message
+    if ($message -match 'cannot be found on this object' -or $message -like 'You cannot call a method on a null-valued expression*') {
+        Disable-WordReport -Reason "Word automation failed: $message. Report generation will continue without the Word document." -Exception $_.Exception
+        continue
+    }
+    throw
+}
+
 # Function to set Writer style
 function Set-WriterStyle {
     param(
@@ -138,6 +260,11 @@ function Save-ReportAndCleanup {
     if ($script:scriptStopwatch) {
         $totalElapsed = $script:scriptStopwatch.Elapsed
         Write-Host ("Total script runtime: {0:hh\:mm\:ss}" -f $totalElapsed) -ForegroundColor Cyan
+    }
+
+    if (-not $Document -or -not $WordApplication) {
+        Write-Warning "Skipping report save because the Word automation object is unavailable."
+        return
     }
 
     try {
@@ -869,6 +996,7 @@ function Add-IntroToReport {
 
 
 $reportRequested = $PSBoundParameters.ContainsKey('FileName')
+$script:reportWasRequested = $reportRequested
 Write-Host "You requested to generate a report:"
 
 Write-Host "DEFENDER ADOPTION HELPER" -ForegroundColor Green
@@ -1057,6 +1185,9 @@ if ($reportRequested) {
     $WordApplication.Visible = $false
     $Document = $WordApplication.Documents.Add()
     $Writer = $WordApplication.Selection
+    Set-Variable -Scope Script -Name WordApplication -Value $WordApplication
+    Set-Variable -Scope Script -Name Document -Value $Document
+    Set-Variable -Scope Script -Name Writer -Value $Writer
 
     # Insert Table of Contents at the beginning
     $null = $Writer.HomeKey(6) # Move to start of document (wdStory)
@@ -1296,13 +1427,19 @@ foreach ($env in $environments) {
     
 
 ##SAVE FILE
-if ($reportRequested) {
+if (Should-WriteReport) {
     Write-Host "***********************"
     Write-Host "SAVING THE REPORT"
     Write-Host "***********************"
     $Document.TablesOfContents.Item(1).Update()
     Save-ReportAndCleanup -FileName $FileName -Document $Document -WordApplication $WordApplication -Format $Format
-
+}
+elseif ($script:reportWasRequested -and $script:wordAutomationDisabled) {
+    Write-Warning 'Report generation was requested but was skipped because Word automation became unavailable.'
+    if ($script:scriptStopwatch) {
+        $finalElapsed = $script:scriptStopwatch.Elapsed
+        Write-Host ("Total script runtime: {0:hh\:mm\:ss}" -f $finalElapsed) -ForegroundColor Cyan
+    }
 }
 elseif ($script:scriptStopwatch) {
     $finalElapsed = $script:scriptStopwatch.Elapsed
