@@ -8,8 +8,8 @@
 #
 # The script authenticates using an Entra App Registration and queries the Azure Management API.
 #
-# Author: [Mario Cuomo]
-# Date: [15th September, 2025]
+# Author: [Rishi Aggarwal]
+# Date: [13th October, 2025]
 # =============================================
 
 # Script Parameters
