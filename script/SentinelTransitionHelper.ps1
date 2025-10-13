@@ -8,8 +8,8 @@
 #
 # The script authenticates using an Entra App Registration and queries the Azure Management API.
 #
-# Author: [Rishi Aggarwal]
-# Date: [13th October, 2025]
+# Author: [Mario Cuomo]
+# Date: [3rd October, 2025]
 # =============================================
 
 # Script Parameters
@@ -317,6 +317,10 @@ function Get-AutomationAnalysis {
 
         $incidentTitle = $false
         $incidentProvider = $false
+        $fusionMentioned = $false
+
+        #$condition = $conditions | ConvertTo-Json
+        #Write-Host $condition
 
         if ($isEnabled -and $triggersOn -eq "Incidents" -and $conditions) {
             foreach ($condition in $conditions) {
@@ -328,8 +332,12 @@ function Get-AutomationAnalysis {
                     $condition.conditionType -eq "Property" -and
                     $condition.conditionProperties.propertyName -eq "IncidentProviderName"
                 ) { $incidentProvider = $true }
-            
-                if ($incidentTitle -and $incidentProvider) {
+                if (
+                    $condition.conditionType -eq "Property" -and
+                    $condition.conditionProperties.propertyName -eq "IncidentRelatedAnalyticRuleIds" -and
+                    ($condition.conditionProperties.propertyValues | Where-Object { $_ -like "*BuiltInFusion" })
+                ) { $fusionMentioned = $true }
+                if ($incidentTitle -and $incidentProvider -and $fusionMentioned) {
                     break
                 }
             }
@@ -378,7 +386,22 @@ function Get-AutomationAnalysis {
                 $Writer.TypeParagraph()
             }
         }
-        if (!$incidentProvider -and !$incidentTitle) {
+        if ($fusionMentioned) {
+            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The automation rule $ruleName is triggered by Fusion incidents. After Sentinel is onboarded in Defender, Fusion will be disabled and this rule won't be triggered anymore"
+            if ($reportRequested) {
+                Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
+                $Writer.TypeText("[WARNING] ")
+                Set-WriterStyle -Writer $Writer -Bold $false -Color 0
+                $Writer.TypeText("The automation rule ")
+                Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
+                $Writer.TypeText($ruleName)
+                Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
+                $Writer.TypeText(" is triggered by Fusion incidents. After Sentinel is onboarded in Defender, Fusion will be disabled and this rule won't be triggered anymore")
+                Set-WriterStyle -Writer $Writer -Italic $false
+                $Writer.TypeParagraph()
+            }
+        }
+        if (!$incidentProvider -and !$incidentTitle -and !$fusionMentioned) {
             Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The automation rule $ruleName is configured correctly"
             $passedControlsTemp++
             if ($reportRequested) {
@@ -829,27 +852,17 @@ function Add-IntroToReport {
 
 
 $reportRequested = $PSBoundParameters.ContainsKey('FileName')
+Write-Host "You requested to generate a report:"
 
 Write-Host "DEFENDER ADOPTION HELPER" -ForegroundColor Green
 Write-Host "This script assists with Defender and Sentinel adoption by checking table retention, analytics rules, and automation rules of your environments."  -ForegroundColor Green
 Write-Host ""
 
-# Define your Entra App Registration and Sentinel details via environment variables
-$tenantId = $env:TENANT_ID
-$clientId = $env:CLIENT_ID
-$clientSecret = $env:CLIENT_SECRET
+# Define your Entra App Registration and Sentinel details
 
-if (-not $tenantId) {
-    throw "TENANT_ID environment variable is not set."
-}
-
-if (-not $clientId) {
-    throw "CLIENT_ID environment variable is not set."
-}
-
-if (-not $clientSecret) {
-    throw "CLIENT_SECRET environment variable is not set."
-}
+$tenantId = "66a5c282-92a6-49d5-9532-3d72398a4cf9"
+$clientId = "0221556f-c768-44f5-847b-47b00751037b"
+$clientSecret = "XXXXX"
 
 # Read environments from JSON file
 if ($EnvironmentsFile) {
