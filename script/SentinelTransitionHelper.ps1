@@ -160,7 +160,7 @@ function Get-AnalysisDefenderData {
     $apiVersion = "2025-02-01"
     foreach ($table in $defenderTables) {
         $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/tables/${table}?api-version=$apiVersion"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+        $response = Invoke-SentinelApi -Uri $uri
         $retentionPeriod = $response.properties.totalRetentionInDays
         $totalControlsTemp = $totalControlsTemp + 1
 
@@ -210,7 +210,7 @@ function Get-AnalyticsAnalysis {
     ## FUSION ENGINE
     $apiVersion = "2025-06-01"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/alertRules/BuiltInFusion?api-version=$apiVersion"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+    $response = Invoke-SentinelApi -Uri $uri
     $totalControlsTemp++
 
     if ($response -eq $null) {
@@ -250,7 +250,7 @@ function Get-AnalyticsAnalysis {
     ## ALERT VISIBILITY
     $apiVersion = "2025-06-01"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/alertRules?api-version=$apiVersion"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+    $response = Invoke-SentinelApi -Uri $uri
     foreach ($rule in $response.value) {
         if ($rule.properties.displayName -eq "Advanced Multistage Attack Detection") {
             continue
@@ -304,7 +304,7 @@ function Get-AutomationAnalysis {
     
     $apiVersion = "2025-09-01"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/automationRules?api-version=$apiVersion"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+    $response = Invoke-SentinelApi -Uri $uri
 
     # Iterate through automation rules
     foreach ($rule in $response.value) {
@@ -900,12 +900,110 @@ if ($EnvironmentsFile) {
         write-Host "   - $($_.workspaceName) in subscription $($_.subscriptionId) and resource group $($_.resourceGroupName)"  -ForegroundColor Green
     }
 }
+
+$script:accessToken = $null
+$script:tokenExpiresAt = Get-Date -Date '1970-01-01T00:00:00Z'
+$script:header = @{}
+$script:scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Request-AccessToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AuthUrl,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$TokenRequestBody
+    )
+
+    $elapsed = $script:scriptStopwatch.Elapsed
+    Write-Host ("[{0:hh\:mm\:ss}] Requesting new access token" -f $elapsed) -ForegroundColor Cyan
+
+    $tokenResponse = Invoke-RestMethod -Method Post -Uri $AuthUrl -Body $TokenRequestBody
+    $script:accessToken = $tokenResponse.access_token
+
+    $expiresIn = 3600
+    if ($tokenResponse.expires_in) {
+        $parsedValue = 0
+        if ([int]::TryParse($tokenResponse.expires_in.ToString(), [ref]$parsedValue)) {
+            $expiresIn = $parsedValue
+        }
+    }
+
+    $bufferSeconds = if ($expiresIn -gt 600) { 300 } else { [Math]::Max([Math]::Floor($expiresIn * 0.1), 30) }
+    $effectiveLifetime = $expiresIn - $bufferSeconds
+    if ($effectiveLifetime -le 0) {
+        $effectiveLifetime = [Math]::Max([Math]::Floor($expiresIn * 0.5), 60)
+    }
+    $script:tokenExpiresAt = (Get-Date).AddSeconds($effectiveLifetime)
+
+    $script:header = @{
+        Authorization = "Bearer $($script:accessToken)"
+        ContentType   = "application/json"
+    }
+}
+
+function Ensure-AccessToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AuthUrl,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$TokenRequestBody
+    )
+
+    if (-not $script:accessToken -or (Get-Date) -ge $script:tokenExpiresAt) {
+        Request-AccessToken -AuthUrl $AuthUrl -TokenRequestBody $TokenRequestBody
+    }
+}
+
+function Invoke-SentinelApi {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Get', 'Post', 'Put', 'Delete', 'Patch', 'Head', 'Options')]
+        [string]$Method = 'Get',
+        [Parameter(Mandatory = $false)]
+        [object]$Body = $null,
+        [Parameter(Mandatory = $false)]
+        [hashtable]$AdditionalHeaders = $null
+    )
+
+    Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
+
+    $effectiveHeaders = @{}
+    foreach ($item in $script:header.GetEnumerator()) {
+        $effectiveHeaders[$item.Key] = $item.Value
+    }
+
+    if ($AdditionalHeaders) {
+        foreach ($item in $AdditionalHeaders.GetEnumerator()) {
+            $effectiveHeaders[$item.Key] = $item.Value
+        }
+    }
+
+    $elapsed = $script:scriptStopwatch.Elapsed
+    Write-Host ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri) -ForegroundColor Yellow
+
+    try {
+        if ($null -ne $Body) {
+            return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders -Body $Body
+        }
+        else {
+            return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders
+        }
+    }
+    catch {
+        $errorElapsed = $script:scriptStopwatch.Elapsed
+        Write-Host ("[{0:hh\:mm\:ss}] ERROR during {1} {2}: {3}" -f $errorElapsed, $Method.ToUpper(), $Uri, $_.Exception.Message) -ForegroundColor Red
+        throw
+    }
+}
 else {
     throw "The EnvironmentsFile parameter is required so that credentials and environments can be loaded."
 }
 
 $resource = "https://management.azure.com/"
 $authUrl = "https://login.microsoftonline.com/$tenantId/oauth2/token"
+$script:authUrl = $authUrl
 
 if ($reportRequested) {
     ## create a Word Application instance and add a document
@@ -969,22 +1067,15 @@ foreach ($env in $environments) {
     $totalControlsTemp = 0
     $passedControlsTemp = 0
 
-    # Prepare the body for the token request
-    $body = @{
+    # Prepare and store the body for the token request
+    $tokenRequestBody = @{
         grant_type    = "client_credentials"
         client_id     = $clientId
         client_secret = $clientSecret
         resource      = $resource
     }
-
-    # Request the token
-    $tokenResponse = Invoke-RestMethod -Method Post -Uri $authUrl -Body $body
-    $accessToken = $tokenResponse.access_token
-
-    $header = @{
-        Authorization = "Bearer $accessToken"
-        ContentType   = "application/json"
-    }
+    $script:tokenRequestBody = $tokenRequestBody
+    Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
 
     $defenderTables = @(
         "DeviceInfo",
