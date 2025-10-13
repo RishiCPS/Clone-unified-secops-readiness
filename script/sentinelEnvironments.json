@@ -1,12 +1,14 @@
 [
   {
-    "subscriptionId": "<your-subscription-id>",
-    "resourceGroupName": "<your-resource-group-name>",
-    "workspaceName": "<your-workspace-name>"
-  },
-    {
-    "subscriptionId": "<your-subscription-id>",
-    "resourceGroupName": "<your-resource-group-name>",
-    "workspaceName": "<your-workspace-name>"
+    "subscriptionId": "69e238c0-023f-455f-8432-013a258cf548",
+    "resourceGroupName": "3psiem",
+    "workspaceName": "danh4"
   }
+  // Additional environments can be added by copying the template below
+  // ,
+  // {
+  //   "subscriptionId": "<your-subscription-id>",
+  //   "resourceGroupName": "<your-resource-group-name>",
+  //   "workspaceName": "<your-workspace-name>"
+  // }
 ]
