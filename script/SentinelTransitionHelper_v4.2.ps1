@@ -22,6 +22,11 @@ param(
     [string]$Format = $null
 )
 
+$script:scriptStartTime = Get-Date
+$script:accessToken = $null
+$script:tokenExpiry = $null
+$script:header = $null
+
 # Function to set Writer style
 function Set-WriterStyle {
     param(
@@ -100,6 +105,69 @@ function Show-HeaderInShell {
 }
 
 
+function Format-ElapsedTime {
+    param(
+        [Parameter(Mandatory = $true)]
+        [TimeSpan]$Duration
+    )
+
+    $parts = @()
+    if ($Duration.Days) { $parts += "$($Duration.Days) day$((if ($Duration.Days -ne 1) { 's' }))" }
+    if ($Duration.Hours) { $parts += "$($Duration.Hours) hour$((if ($Duration.Hours -ne 1) { 's' }))" }
+    if ($Duration.Minutes) { $parts += "$($Duration.Minutes) minute$((if ($Duration.Minutes -ne 1) { 's' }))" }
+    if ($Duration.Seconds -or -not $parts.Count) { $parts += "$($Duration.Seconds) second$((if ($Duration.Seconds -ne 1) { 's' }))" }
+
+    return ($parts -join ", ")
+}
+
+function Ensure-AccessToken {
+    param(
+        [switch]$ForceRefresh
+    )
+
+    if ($ForceRefresh -or -not $script:tokenExpiry -or (Get-Date) -ge $script:tokenExpiry) {
+        $body = @{
+            grant_type    = "client_credentials"
+            client_id     = $clientId
+            client_secret = $clientSecret
+            resource      = $resource
+        }
+
+        $tokenResponse = Invoke-RestMethod -Method Post -Uri $authUrl -Body $body
+        $script:accessToken = $tokenResponse.access_token
+
+        $expiresInSeconds = [int]$tokenResponse.expires_in
+        $refreshWindow = [Math]::Max($expiresInSeconds - 300, 60)
+        $script:tokenExpiry = (Get-Date).AddSeconds($refreshWindow)
+
+        $script:header = @{
+            Authorization = "Bearer $($script:accessToken)"
+            ContentType   = "application/json"
+        }
+    }
+
+    return $script:header
+}
+
+function Invoke-DefenderRestMethod {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        [ValidateSet('Get', 'Post', 'Put', 'Delete', 'Patch')]
+        [string]$Method = 'Get',
+        $Body
+    )
+
+    $header = Ensure-AccessToken
+
+    if ($PSBoundParameters.ContainsKey('Body')) {
+        return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $header -Body $Body
+    }
+
+    return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $header
+}
+
+
 # Function to save the report and clean up resources
 function Save-ReportAndCleanup {
     param(
@@ -137,7 +205,12 @@ function Save-ReportAndCleanup {
 
     try {
         $Document.SaveAs2([string]$savePath, [ref]$wdFormat)
-        Write-Host "Report generated on" (Get-Date -Format "yyyy-MM-dd")
+        $generationDate = Get-Date -Format "yyyy-MM-dd"
+        Write-Host "Report generated on $generationDate"
+
+        $duration = New-TimeSpan -Start $script:scriptStartTime -End (Get-Date)
+        $formatted = Format-ElapsedTime -Duration $duration
+        Write-Host "Total runtime: $formatted" -ForegroundColor Cyan
     }
     finally {
         $WordApplication.Quit()
@@ -160,12 +233,22 @@ function Get-AnalysisDefenderData {
     $apiVersion = "2025-02-01"
     foreach ($table in $defenderTables) {
         $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/tables/${table}?api-version=$apiVersion"
-        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+        $response = Invoke-DefenderRestMethod -Uri $uri
         $retentionPeriod = $response.properties.totalRetentionInDays
+        $planProperty = $response.properties.plan
+        if ($null -eq $planProperty) {
+            $plan = 'Unknown'
+        }
+        elseif ($planProperty -is [string]) {
+            $plan = if ([string]::IsNullOrWhiteSpace($planProperty)) { 'Unknown' } else { $planProperty }
+        }
+        else {
+            $plan = ($planProperty | ConvertTo-Json -Compress)
+        }
         $totalControlsTemp = $totalControlsTemp + 1
 
         if ($response.properties.totalRetentionInDays -lt 31) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The table $table has a retention of $retentionPeriod days - no need to ingest this data in Sentinel" 
+            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The table $table has a retention of $retentionPeriod days (plan: $plan) - no need to ingest this data in Sentinel"
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
                 $Writer.TypeText("[WARNING] ")
@@ -175,12 +258,12 @@ function Get-AnalysisDefenderData {
                 $Writer.TypeText($table)
                 Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
                 $Writer.Font.Bold = $false
-                $Writer.TypeText(" has a retention of $retentionPeriod days - no need to ingest this data in Sentinel")
+                $Writer.TypeText(" has a retention of $retentionPeriod days (plan: $plan) - no need to ingest this data in Sentinel")
                 $Writer.TypeParagraph()
             }
         }
         else {
-            Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The table $table has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention" 
+            Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The table $table has a retention of $retentionPeriod days (plan: $plan) - need to be stored in Sentinel for more retention"
             $passedControlsTemp = $passedControlsTemp + 1
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 5287936 -Bold $true
@@ -190,7 +273,7 @@ function Get-AnalysisDefenderData {
                 Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
                 $Writer.TypeText($table)
                 Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
-                $Writer.TypeText(" has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention")
+                $Writer.TypeText(" has a retention of $retentionPeriod days (plan: $plan) - need to be stored in Sentinel for more retention")
                 $Writer.TypeParagraph()
             }
         }
@@ -210,7 +293,7 @@ function Get-AnalyticsAnalysis {
     ## FUSION ENGINE
     $apiVersion = "2025-06-01"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/alertRules/BuiltInFusion?api-version=$apiVersion"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+    $response = Invoke-DefenderRestMethod -Uri $uri
     $totalControlsTemp++
 
     if ($response -eq $null) {
@@ -250,7 +333,7 @@ function Get-AnalyticsAnalysis {
     ## ALERT VISIBILITY
     $apiVersion = "2025-06-01"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/alertRules?api-version=$apiVersion"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+    $response = Invoke-DefenderRestMethod -Uri $uri
     foreach ($rule in $response.value) {
         if ($rule.properties.displayName -eq "Advanced Multistage Attack Detection") {
             continue
@@ -304,7 +387,7 @@ function Get-AutomationAnalysis {
     
     $apiVersion = "2025-09-01"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/automationRules?api-version=$apiVersion"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+    $response = Invoke-DefenderRestMethod -Uri $uri
 
     # Iterate through automation rules
     foreach ($rule in $response.value) {
@@ -407,7 +490,7 @@ function Get-AnalyticsCustomDetectionAnalysis {
 
     $apiVersion = "2025-07-01-preview"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/alertRules?api-version=$apiVersion"
-    $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $header
+    $response = Invoke-DefenderRestMethod -Uri $uri
     foreach ($rule in $response.value) {
         if ($rule.properties.displayName -eq "Advanced Multistage Attack Detection") {
             continue
@@ -923,22 +1006,7 @@ foreach ($env in $environments) {
     $totalControlsTemp = 0
     $passedControlsTemp = 0
 
-    # Prepare the body for the token request
-    $body = @{
-        grant_type    = "client_credentials"
-        client_id     = $clientId
-        client_secret = $clientSecret
-        resource      = $resource
-    }
-
-    # Request the token
-    $tokenResponse = Invoke-RestMethod -Method Post -Uri $authUrl -Body $body
-    $accessToken = $tokenResponse.access_token
-
-    $header = @{
-        Authorization = "Bearer $accessToken"
-        ContentType   = "application/json"
-    }
+    Ensure-AccessToken -ForceRefresh | Out-Null
 
     $defenderTables = @(
         "DeviceInfo",
@@ -1055,38 +1123,54 @@ foreach ($env in $environments) {
         $Writer.TypeText("$totalPassedControls/$totalControls ($scorePercent%)")
         $Writer.TypeParagraph()
 
-        $excel = New-Object -ComObject Excel.Application
-        $excel.Visible = $false
-        $workbook = $excel.Workbooks.Add()
-        $sheet = $workbook.Sheets.Item(1)
+        $excel = $null
+        $workbook = $null
+        $sheet = $null
+        $chart = $null
+        try {
+            $excel = New-Object -ComObject Excel.Application
+            $excel.Visible = $false
+            $workbook = $excel.Workbooks.Add()
+            $sheet = $workbook.Sheets.Item(1)
 
-        $sheet.Cells.Item(1, 1).Value2 = "Controls"
-        $sheet.Cells.Item(1, 2).Value2 = "Values"
-        $sheet.Cells.Item(2, 1).Value2 = "Passed Controls"
-        $sheet.Cells.Item(2, 2).Value2 = $totalPassedControls
-        $sheet.Cells.Item(3, 1).Value2 = "Not Passed Controls"
-        $sheet.Cells.Item(3, 2).Value2 = $totalControls - $totalPassedControls
+            $sheet.Cells.Item(1, 1).Value2 = "Controls"
+            $sheet.Cells.Item(1, 2).Value2 = "Values"
+            $sheet.Cells.Item(2, 1).Value2 = "Passed Controls"
+            $sheet.Cells.Item(2, 2).Value2 = $totalPassedControls
+            $sheet.Cells.Item(3, 1).Value2 = "Not Passed Controls"
+            $sheet.Cells.Item(3, 2).Value2 = $totalControls - $totalPassedControls
 
-        $chart = $sheet.Shapes.AddChart2(251, 5, $sheet.Cells.Item(5, 1).Left, $sheet.Cells.Item(5, 1).Top, 400, 300).Chart
-        $chart.SetSourceData($sheet.Range("A1:B3"))
-        $chart.ChartTitle.Text = "Final Score Distribution"
-        $chart.ApplyDataLabels()
-        foreach ($point in $chart.SeriesCollection(1).Points()) {
-            $point.DataLabel.Font.Color = 0x000000
-            $point.DataLabel.Font.Size = 14
+            $chart = $sheet.Shapes.AddChart2(251, 5, $sheet.Cells.Item(5, 1).Left, $sheet.Cells.Item(5, 1).Top, 400, 300).Chart
+            $chart.SetSourceData($sheet.Range("A1:B3"))
+            $chart.ChartTitle.Text = "Final Score Distribution"
+            $chart.ApplyDataLabels()
+            foreach ($point in $chart.SeriesCollection(1).Points()) {
+                $point.DataLabel.Font.Color = 0x000000
+                $point.DataLabel.Font.Size = 14
 
+            }
+            $chart.ChartArea.Format.Line.Visible = 0
+            $chart.SeriesCollection(1).Points(1).Format.Fill.ForeColor.RGB = 0x57BF67  # Dark Green
+            $chart.SeriesCollection(1).Points(2).Format.Fill.ForeColor.RGB = 0x000000FF  # Red
+
+            $chart.ChartArea.Copy()
+
+            # Paste chart into Word
+            $Writer.TypeParagraph()
+            Start-Sleep -Milliseconds 500
+
+            $Writer.Paste()
         }
-        $chart.ChartArea.Format.Line.Visible = 0 
-        $chart.SeriesCollection(1).Points(1).Format.Fill.ForeColor.RGB = 0x57BF67  # Dark Green
-        $chart.SeriesCollection(1).Points(2).Format.Fill.ForeColor.RGB = 0x000000FF  # Red
+        finally {
+            if ($workbook) { $workbook.Close($false) }
+            if ($excel) { $excel.Quit() }
 
-        $chart.ChartArea.Copy()
-
-        # Paste chart into Word
-        $Writer.TypeParagraph()
-        Start-Sleep -Milliseconds 500
-
-        $Writer.Paste()
+            foreach ($comObject in @($chart, $sheet, $workbook, $excel)) {
+                if ($comObject) {
+                    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) | Out-Null
+                }
+            }
+        }
 
     }
 
@@ -1119,4 +1203,9 @@ if ($reportRequested) {
     Write-Host "***********************"
     $Document.TablesOfContents.Item(1).Update()
     Save-ReportAndCleanup -FileName $FileName -Document $Document -WordApplication $WordApplication -Format $Format
+}
+else {
+    $duration = New-TimeSpan -Start $script:scriptStartTime -End (Get-Date)
+    $formatted = Format-ElapsedTime -Duration $duration
+    Write-Host "Total runtime: $formatted" -ForegroundColor Cyan
 }
