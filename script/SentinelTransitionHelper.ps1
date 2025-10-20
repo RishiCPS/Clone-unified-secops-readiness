@@ -664,32 +664,9 @@ function Set-WriterStyle {
         [bool]$Bold = $false,
         [bool]$Italic = $false
     )
-    if (-not $Writer) {
-        return
-    }
-
-    $font = $null
-    try {
-        if ($Writer | Get-Member -Name 'Font' -ErrorAction Ignore) {
-            $font = $Writer.Font
-        }
-    } catch {
-        $font = $null
-    }
-
-    if (-not $font) {
-        return
-    }
-
-    if ($font | Get-Member -Name 'Color' -ErrorAction Ignore) {
-        try { $font.Color = $Color } catch { }
-    }
-    if ($font | Get-Member -Name 'Bold' -ErrorAction Ignore) {
-        try { $font.Bold = $Bold } catch { }
-    }
-    if ($font | Get-Member -Name 'Italic' -ErrorAction Ignore) {
-        try { $font.Italic = $Italic } catch { }
-    }
+    $Writer.Font.Color = $Color
+    $Writer.Font.Bold = $Bold
+    $Writer.Font.Italic = $Italic
 }
 
 # Function to write an header2
@@ -848,12 +825,6 @@ function Get-AnalysisDefenderData {
             $query = Get-UniversalKqlQuery -WindowDays $KqlWindowDays
             $rows = Invoke-WorkspaceKql -WorkspaceId $effectiveWorkspaceId -Query $query
 
-            if (-not $rows -or $rows.Count -eq 0) {
-                Write-Log WARN $operation 'Universal KQL query returned no rows.' @{ Workspace = $workspaceName }
-            } else {
-                Write-Log INFO $operation 'Universal KQL query returned rows.' @{ Workspace = $workspaceName; RowCount = $rows.Count }
-            }
-
             $universal = Build-UniversalFromKql -KqlRows $rows
             Add-DefenderTablesToUniversal -Map $universal -DefenderTables $defenderTables
             Enrich-WithApi -Map $universal -DefenderTables $defenderTables -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -WorkspaceName $workspaceName -ApiVersion $ApiVersion
@@ -863,10 +834,7 @@ function Get-AnalysisDefenderData {
 
             Set-Variable -Scope Script -Name UniversalTables -Value $universal
 
-            $tablesToEvaluate = @($universal.GetEnumerator() | ForEach-Object { $_.Value })
-            if ($IncludeOnlyDefender) {
-                $tablesToEvaluate = $tablesToEvaluate | Where-Object { $_.IsDefenderTable }
-            }
+            $tablesToEvaluate = $universal.Values | Where-Object { $_.IsDefenderTable }
 
             foreach ($tableInfo in $tablesToEvaluate) {
                 $totalControlsTemp++
