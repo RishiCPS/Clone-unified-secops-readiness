@@ -257,7 +257,6 @@ function Invoke-WorkspaceKql {
     )
 
     $operation = 'KQL-Discovery'
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Log INFO $operation 'Submitting KQL query.' @{ WorkspaceId = $WorkspaceId }
 
     $token = Get-LogAnalyticsAccessToken
@@ -281,13 +280,11 @@ function Invoke-WorkspaceKql {
                 $rows += [pscustomobject]$obj
             }
         }
-        $stopwatch.Stop()
-        Write-Log INFO $operation 'KQL query completed successfully.' @{ WorkspaceId = $WorkspaceId; RowCount = $rows.Count; DurationMs = $stopwatch.ElapsedMilliseconds }
+        Write-Log INFO $operation "KQL returned $($rows.Count) rows." @{ WorkspaceId = $WorkspaceId }
         return $rows
     } catch {
         $detail = Get-ErrorDetail $_
-        $stopwatch.Stop()
-        Write-Log ERROR $operation ('KQL failed: ' + ($detail | ConvertTo-Json -Compress)) @{ WorkspaceId = $WorkspaceId; DurationMs = $stopwatch.ElapsedMilliseconds }
+        Write-Log ERROR $operation ('KQL failed: ' + ($detail | ConvertTo-Json -Compress)) @{ WorkspaceId = $WorkspaceId }
         return @()
     }
 }
@@ -369,18 +366,13 @@ function Get-TableProps {
 
     while ($attempt -lt $maxAttempts) {
         $attempt++
-        $attemptWatch = [System.Diagnostics.Stopwatch]::StartNew()
         Write-Log INFO $operation 'Fetching table properties.' @{ Table = $Table; Attempt = $attempt }
         try {
-            $result = Invoke-SentinelApi -Uri $uri
-            $attemptWatch.Stop()
-            Write-Log INFO $operation 'Table properties retrieved.' @{ Table = $Table; Attempt = $attempt; DurationMs = $attemptWatch.ElapsedMilliseconds }
-            return $result
+            return Invoke-SentinelApi -Uri $uri
         } catch {
             $detail = Get-ErrorDetail $_
             $status = $detail.HttpStatus
-            $attemptWatch.Stop()
-            Write-Log WARN $operation ('Attempt failed: ' + ($detail | ConvertTo-Json -Compress)) @{ Table = $Table; Attempt = $attempt; Status = $status; DurationMs = $attemptWatch.ElapsedMilliseconds }
+            Write-Log WARN $operation ('Attempt failed: ' + ($detail | ConvertTo-Json -Compress)) @{ Table = $Table; Attempt = $attempt; Status = $status }
 
             if ($attempt -ge $maxAttempts -or ($status -and $status -lt 500 -and $status -ne 429)) {
                 Write-Log ERROR $operation 'Giving up on table after retries.' @{ Table = $Table; Attempts = $attempt }
@@ -405,11 +397,9 @@ function Enrich-WithApi {
     )
 
     $operation = 'Universal-Enrich'
-    $namesToFetch = [System.Collections.Generic.List[string]]::new()
+    $allNames = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($name in $Map.Keys) {
-        if (-not $namesToFetch.Contains($name)) {
-            [void]$namesToFetch.Add($name)
-        }
+        [void]$allNames.Add($name)
     }
     foreach ($name in $DefenderTables) {
         if (-not $Map.ContainsKey($name)) {
@@ -426,19 +416,11 @@ function Enrich-WithApi {
                 Notes           = 'Added from Defender list'
             }
         }
-        if (-not $namesToFetch.Contains($name)) {
-            [void]$namesToFetch.Add($name)
-        }
+        [void]$allNames.Add($name)
         $Map[$name].IsDefenderTable = $true
     }
 
-    $total = $namesToFetch.Count
-    Write-Log INFO $operation 'Prepared table list for API enrichment.' @{ TotalTables = $total; UniversalCount = $Map.Keys.Count; DefenderCount = $DefenderTables.Count }
-
-    $index = 0
-    foreach ($name in $namesToFetch) {
-        $index++
-        Write-Log INFO $operation 'Requesting table properties from API.' @{ Table = $name; Index = $index; Total = $total }
+    foreach ($name in $allNames) {
         $response = Get-TableProps -SubscriptionId $SubscriptionId -ResourceGroupName $ResourceGroupName -WorkspaceName $WorkspaceName -Table $name -ApiVersion $ApiVersion
         if ($response -and $response.properties) {
             $properties = $response.properties
@@ -456,7 +438,6 @@ function Enrich-WithApi {
             Write-Log DEBUG $operation 'Enriched table from API.' @{ Table = $name; Retention = $Map[$name].RetentionDays; Plan = $Map[$name].Plan }
         } else {
             $Map[$name].Notes = 'API lookup failed or returned no properties.'
-            Write-Log WARN $operation 'API lookup failed or returned no properties.' @{ Table = $name }
         }
     }
 
@@ -871,11 +852,6 @@ function Get-AnalysisDefenderData {
                 Write-Log WARN $operation 'Universal KQL query returned no rows.' @{ Workspace = $workspaceName }
             } else {
                 Write-Log INFO $operation 'Universal KQL query returned rows.' @{ Workspace = $workspaceName; RowCount = $rows.Count }
-                Write-Host "" 
-                Write-Host "===== Universal KQL results =====" -ForegroundColor Cyan
-                $formatted = $rows | Format-Table -AutoSize | Out-String -Width 512
-                Write-Host $formatted
-                Write-Host "===== End of KQL results =====" -ForegroundColor Cyan
             }
 
             $universal = Build-UniversalFromKql -KqlRows $rows
