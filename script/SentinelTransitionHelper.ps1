@@ -671,16 +671,25 @@ function Get-AnalysisDefenderData {
         }
 
         $metadata = Get-TableMetadataSoft -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -WorkspaceName $workspaceName -TableName $table -ApiVersion $apiVersion
+        if (-not $metadata) {
+            $metadata = [pscustomobject]@{
+                Plan          = 'Unknown'
+                RetentionDays = $null
+                Notes         = 'API lookup failed'
+            }
+        }
 
         if ($entry -is [System.Collections.IDictionary]) {
-            $entry['Plan'] = $metadata.Plan
-            $entry['RetentionDays'] = $metadata.RetentionDays
-            $entry['Notes'] = $metadata.Notes
+            $entry['Plan'] = if ($metadata.PSObject.Properties.Match('Plan').Count -gt 0) { $metadata.Plan } else { 'Unknown' }
+            $entry['RetentionDays'] = if ($metadata.PSObject.Properties.Match('RetentionDays').Count -gt 0) { $metadata.RetentionDays } else { $null }
+            if ($metadata.PSObject.Properties.Match('Notes').Count -gt 0) {
+                $entry['Notes'] = $metadata.Notes
+            }
         }
 
         $planValue = if ($entry.Contains('Plan')) { $entry['Plan'] } else { $null }
         $planDisplay = 'Unknown'
-        if ($planValue) {
+        if ($null -ne $planValue) {
             if ($planValue -is [string]) {
                 if (-not [string]::IsNullOrWhiteSpace($planValue)) {
                     $planDisplay = $planValue
@@ -691,7 +700,12 @@ function Get-AnalysisDefenderData {
                     $planDisplay = ($planValue | ConvertTo-Json -Compress)
                 }
                 catch {
-                    $planDisplay = $planValue.ToString()
+                    try {
+                        $planDisplay = $planValue.ToString()
+                    }
+                    catch {
+                        $planDisplay = 'Unknown'
+                    }
                 }
             }
         }
@@ -724,17 +738,32 @@ function Get-AnalysisDefenderData {
 
         $retentionDisplay = 'Unknown'
         if ($null -ne $retentionNumeric) {
-            $retentionDisplay = $retentionNumeric
+            $retentionDisplay = [string]$retentionNumeric
         }
-        elseif ($null -ne $retentionValue -and -not [string]::IsNullOrWhiteSpace([string]$retentionValue)) {
-            $retentionDisplay = $retentionValue
+        elseif ($null -ne $retentionValue) {
+            $retentionText = [string]$retentionValue
+            if (-not [string]::IsNullOrWhiteSpace($retentionText)) {
+                $retentionDisplay = $retentionText
+            }
         }
 
         $billableValue = if ($entry.Contains('Billable_90d')) { $entry['Billable_90d'] } else { $null }
-        $billableDisplay = if (-not [string]::IsNullOrWhiteSpace([string]$billableValue)) { $billableValue } else { 'Unknown' }
+        $billableDisplay = 'Unknown'
+        if ($null -ne $billableValue) {
+            $billableText = [string]$billableValue
+            if (-not [string]::IsNullOrWhiteSpace($billableText)) {
+                $billableDisplay = $billableText
+            }
+        }
 
         $lastSeenValue = if ($entry.Contains('LastSeen')) { $entry['LastSeen'] } else { $null }
-        $lastSeenDisplay = if (-not [string]::IsNullOrWhiteSpace([string]$lastSeenValue)) { $lastSeenValue } else { 'Unknown' }
+        $lastSeenDisplay = 'Unknown'
+        if ($null -ne $lastSeenValue) {
+            $lastSeenText = [string]$lastSeenValue
+            if (-not [string]::IsNullOrWhiteSpace($lastSeenText)) {
+                $lastSeenDisplay = $lastSeenText
+            }
+        }
 
         $gb90Value = if ($entry.Contains('GB_90')) { $entry['GB_90'] } else { 0 }
         if ($null -eq $gb90Value) { $gb90Value = 0 }
@@ -767,37 +796,51 @@ function Get-AnalysisDefenderData {
             }
         }
 
-        $isDefValue = if ($entry.Contains('IsDefenderTable')) { $entry['IsDefenderTable'] } else { $false }
-        if ($null -eq $isDefValue) { $isDefValue = $false }
-
-        $isOk = $false
-        if ($null -ne $retentionNumeric) {
-            if ($retentionNumeric -ge 90) {
-                $isOk = $true
+        $isDefValue = if ($entry.Contains('IsDefenderTable')) { $entry['IsDefenderTable'] } else { $null }
+        $isDefDisplay = 'Unknown'
+        if ($null -ne $isDefValue) {
+            if ($isDefValue -is [bool]) {
+                $isDefDisplay = if ($isDefValue) { 'True' } else { 'False' }
+            }
+            else {
+                $isDefText = [string]$isDefValue
+                if (-not [string]::IsNullOrWhiteSpace($isDefText)) {
+                    $isDefDisplay = $isDefText
+                }
             }
         }
 
+        $isOk = ($null -ne $retentionNumeric) -and ($retentionNumeric -ge 90)
+        $statusMessage = if ($isOk) { 'data should remain stored in Sentinel for ongoing retention.' } else { 'no need to ingest this data in Sentinel.' }
+
         if ($isOk) {
-            Write-Host "[OK]" -ForegroundColor Green -NoNewline
-            Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionDisplay days — data should remain stored in Sentinel for ongoing retention." -ForegroundColor White
+            Write-Host '[OK]' -ForegroundColor Green -NoNewline
             $passedControlsTemp++
         }
         else {
-            Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline
-            Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionDisplay days — no need to ingest this data in Sentinel." -ForegroundColor White
+            Write-Host '[WARNING]' -ForegroundColor Yellow -NoNewline
         }
 
-        Write-Host "  ↳ " -NoNewline
-        Write-Host "IsDefenderTable: " -ForegroundColor Cyan -NoNewline
-        Write-Host "$isDefValue" -ForegroundColor White -NoNewline
-        Write-Host " | Billable_90d: " -ForegroundColor Cyan -NoNewline
-        Write-Host "$billableDisplay" -ForegroundColor White -NoNewline
-        Write-Host " | LastSeen: " -ForegroundColor Cyan -NoNewline
-        Write-Host "$lastSeenDisplay" -ForegroundColor White -NoNewline
-        Write-Host " | GB_90: " -ForegroundColor Cyan -NoNewline
-        Write-Host "$gb90Display" -ForegroundColor White -NoNewline
-        Write-Host " | GB_30_from90: " -ForegroundColor Cyan -NoNewline
-        Write-Host "$gb30Display" -ForegroundColor White
+        Write-Host (" The table {0} (plan: {1}) has a retention of {2} days — {3}" -f $table, $planDisplay, $retentionDisplay, $statusMessage) -ForegroundColor White
+
+        Write-Host '  ↳ ' -ForegroundColor White -NoNewline
+        $parameterPairs = @(
+            @{ Label = 'IsDefenderTable'; Value = $isDefDisplay },
+            @{ Label = 'Billable_90d'; Value = $billableDisplay },
+            @{ Label = 'LastSeen'; Value = $lastSeenDisplay },
+            @{ Label = 'GB_90'; Value = $gb90Display },
+            @{ Label = 'GB_30_from90'; Value = $gb30Display }
+        )
+
+        for ($i = 0; $i -lt $parameterPairs.Count; $i++) {
+            $pair = $parameterPairs[$i]
+            Write-Host ("{0}: " -f $pair.Label) -ForegroundColor Cyan -NoNewline
+            Write-Host ($pair.Value) -ForegroundColor White -NoNewline
+            if ($i -lt ($parameterPairs.Count - 1)) {
+                Write-Host ' | ' -ForegroundColor White -NoNewline
+            }
+        }
+        Write-Host ''
 
         if ($reportRequested) {
             $statusLabel = if ($isOk) { '[OK]' } else { '[WARNING]' }
@@ -805,16 +848,11 @@ function Get-AnalysisDefenderData {
             Set-WriterStyle -Writer $Writer -Color $statusColor -Bold $true
             $Writer.TypeText("$statusLabel ")
             Set-WriterStyle -Writer $Writer -Color 0 -Bold $false
-            $Writer.TypeText("The table ")
+            $Writer.TypeText('The table ')
             Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
             $Writer.TypeText($table)
             Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
-            if ($isOk) {
-                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionDisplay days — data should remain stored in Sentinel for ongoing retention.")
-            }
-            else {
-                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionDisplay days — no need to ingest this data in Sentinel.")
-            }
+            $Writer.TypeText((" (plan: {0}) has a retention of {1} days — {2}" -f $planDisplay, $retentionDisplay, $statusMessage))
             $Writer.TypeParagraph()
         }
     }
