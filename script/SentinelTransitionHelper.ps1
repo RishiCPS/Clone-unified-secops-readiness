@@ -539,7 +539,7 @@ function Get-AnalysisDefenderData {
 
     foreach ($table in @($Universal.Keys)) {
         $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/tables/${table}?api-version=$apiVersion"
-        Write-Host "Invoking GET $uri"
+       # Write-Host "Invoking GET $uri"
 
         try {
             $response = Invoke-SentinelApi -Uri $uri -ErrorAction Stop
@@ -1587,7 +1587,7 @@ function Invoke-SentinelApi {
         }
 
         $elapsed = $script:scriptStopwatch.Elapsed
-        Write-Host ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri) -ForegroundColor Yellow
+        #Write-Host ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri) -ForegroundColor Yellow
 
         try {
             if ($null -ne $Body) {
