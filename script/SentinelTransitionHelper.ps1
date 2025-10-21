@@ -370,8 +370,13 @@ function Should-WriteReport {
 }
 
 trap [System.Runtime.InteropServices.COMException] {
-    if ($_.Exception.HResult -eq -2147023174) {
+    $hresult = $_.Exception.HResult
+    if ($hresult -eq -2147023174) {
         Disable-WordReport -Reason "Word automation became unavailable (RPC server is unavailable). Report generation will continue without the Word document." -Exception $_.Exception
+        continue
+    }
+    elseif ($hresult -in @(-2147221164, -2146959355)) {
+        Disable-WordReport -Reason "Word automation is unavailable on this machine (is Microsoft Word installed and registered?). Report generation will continue without the Word document." -Exception $_.Exception
         continue
     }
     throw
