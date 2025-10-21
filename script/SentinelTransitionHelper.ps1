@@ -96,6 +96,9 @@ allTables
 '@
 $script:kqlResultRows = @()
 $script:universalTable = @{}
+$script:logAnalyticsAccessToken = $null
+$script:logAnalyticsTokenExpiresAt = Get-Date -Date '1970-01-01T00:00:00Z'
+$script:logAnalyticsTokenRequestBody = $null
 
 function Invoke-LogAnalyticsUsageQuery {
     param(
@@ -115,7 +118,14 @@ function Invoke-LogAnalyticsUsageQuery {
         return $null
     }
 
-    if (-not $script:accessToken) {
+    if (-not $script:authUrl -or -not $script:logAnalyticsTokenRequestBody) {
+        Write-Warning "Cannot execute Log Analytics query because the Log Analytics token configuration is missing."
+        return $null
+    }
+
+    Ensure-LogAnalyticsAccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:logAnalyticsTokenRequestBody
+
+    if (-not $script:logAnalyticsAccessToken) {
         Write-Warning "Cannot execute Log Analytics query because an access token is not available."
         return $null
     }
@@ -123,7 +133,7 @@ function Invoke-LogAnalyticsUsageQuery {
     $uri = "https://api.loganalytics.io/v1/workspaces/$WorkspaceId/query"
     $body = @{ query = $Query } | ConvertTo-Json -Depth 5
     $headers = @{
-        Authorization = "Bearer $($script:accessToken)"
+        Authorization = "Bearer $($script:logAnalyticsAccessToken)"
         "Content-Type" = "application/json"
     }
 
@@ -135,7 +145,46 @@ function Invoke-LogAnalyticsUsageQuery {
     }
     catch {
         $errorElapsed = if ($script:scriptStopwatch) { $script:scriptStopwatch.Elapsed } else { [TimeSpan]::Zero }
-        Write-Host ("[{0:hh\:mm\:ss}] ERROR executing Log Analytics query: {1}" -f $errorElapsed, $_.Exception.Message) -ForegroundColor Red
+
+        $statusCode = $null
+        $responseBody = $null
+
+        if ($_.Exception.Response) {
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            catch {
+                try {
+                    if ($_.Exception.Response.StatusCode.value__) {
+                        $statusCode = [int]$_.Exception.Response.StatusCode.value__
+                    }
+                }
+                catch {
+                    $statusCode = $null
+                }
+            }
+
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $responseBody = $reader.ReadToEnd()
+                    $reader.Dispose()
+                    $stream.Dispose()
+                }
+            }
+            catch {
+                $responseBody = $null
+            }
+        }
+
+        $statusFragment = if ($statusCode) { " (HTTP $statusCode)" } else { "" }
+        Write-Host ("[{0:hh\:mm\:ss}] ERROR executing Log Analytics query{1}: {2}" -f $errorElapsed, $statusFragment, $_.Exception.Message) -ForegroundColor Red
+
+        if ($responseBody) {
+            Write-Host "Response content:`n$responseBody" -ForegroundColor DarkRed
+        }
+
         return $null
     }
 }
@@ -1306,6 +1355,50 @@ function Ensure-AccessToken {
     }
 }
 
+function Request-LogAnalyticsAccessToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AuthUrl,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$TokenRequestBody
+    )
+
+    $elapsed = $script:scriptStopwatch.Elapsed
+    Write-Host ("[{0:hh\:mm\:ss}] Requesting new Log Analytics access token" -f $elapsed) -ForegroundColor Cyan
+
+    $tokenResponse = Invoke-RestMethod -Method Post -Uri $AuthUrl -Body $TokenRequestBody
+    $script:logAnalyticsAccessToken = $tokenResponse.access_token
+
+    $expiresIn = 3600
+    if ($tokenResponse.expires_in) {
+        $parsedValue = 0
+        if ([int]::TryParse($tokenResponse.expires_in.ToString(), [ref]$parsedValue)) {
+            $expiresIn = $parsedValue
+        }
+    }
+
+    $bufferSeconds = if ($expiresIn -gt 600) { 300 } else { [Math]::Max([Math]::Floor($expiresIn * 0.1), 30) }
+    $effectiveLifetime = $expiresIn - $bufferSeconds
+    if ($effectiveLifetime -le 0) {
+        $effectiveLifetime = [Math]::Max([Math]::Floor($expiresIn * 0.5), 60)
+    }
+
+    $script:logAnalyticsTokenExpiresAt = (Get-Date).AddSeconds($effectiveLifetime)
+}
+
+function Ensure-LogAnalyticsAccessToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AuthUrl,
+        [Parameter(Mandatory = $true)]
+        [hashtable]$TokenRequestBody
+    )
+
+    if (-not $script:logAnalyticsAccessToken -or (Get-Date) -ge $script:logAnalyticsTokenExpiresAt) {
+        Request-LogAnalyticsAccessToken -AuthUrl $AuthUrl -TokenRequestBody $TokenRequestBody
+    }
+}
+
 function Invoke-SentinelApi {
     param(
         [Parameter(Mandatory = $true)]
@@ -1458,6 +1551,33 @@ foreach ($env in $environments) {
         resource      = $resource
     }
     $script:tokenRequestBody = $tokenRequestBody
+
+    $logAnalyticsResource = "https://api.loganalytics.io"
+    $logAnalyticsTokenRequestBody = @{
+        grant_type    = "client_credentials"
+        client_id     = $clientId
+        client_secret = $clientSecret
+        resource      = $logAnalyticsResource
+    }
+
+    $resetLogAnalyticsToken = $false
+    if (-not $script:logAnalyticsTokenRequestBody) {
+        $resetLogAnalyticsToken = $true
+    }
+    else {
+        if ($script:logAnalyticsTokenRequestBody.client_id -ne $clientId -or
+            $script:logAnalyticsTokenRequestBody.client_secret -ne $clientSecret -or
+            $script:logAnalyticsTokenRequestBody.resource -ne $logAnalyticsResource) {
+            $resetLogAnalyticsToken = $true
+        }
+    }
+
+    if ($resetLogAnalyticsToken) {
+        $script:logAnalyticsAccessToken = $null
+        $script:logAnalyticsTokenExpiresAt = Get-Date -Date '1970-01-01T00:00:00Z'
+    }
+
+    $script:logAnalyticsTokenRequestBody = $logAnalyticsTokenRequestBody
     $null = Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
 
     $kqlResultRows = @()
