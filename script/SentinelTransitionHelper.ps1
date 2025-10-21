@@ -66,6 +66,185 @@ $script:reportWasRequested = $false
 Set-Variable -Scope Script -Name WordApplication -Value $null
 Set-Variable -Scope Script -Name Document -Value $null
 Set-Variable -Scope Script -Name Writer -Value ([NullWordSelection]::new())
+$script:currentWorkspaceId = $null
+$script:logAnalyticsQuery = @'
+let GB = 1024.0 * 1024 * 1024;
+let d90 =
+union withsource=SrcTable *
+| where TimeGenerated > ago(90d)
+| summarize Bytes90 = sumif(_BilledSize, _IsBillable == true) by SrcTable;
+let lastSeen =
+union withsource=SrcTable *
+| summarize LastEventTime = max(TimeGenerated) by SrcTable;
+let allTables =
+union withsource=SrcTable *
+| summarize dummy = any(true) by SrcTable;
+allTables
+| join kind=leftouter d90 on SrcTable
+| join kind=leftouter lastSeen on SrcTable
+| extend Billable_90d = iif(tolong(Bytes90) > 0, "Yes", "No")
+| extend LastSeen = iif(isnull(LastEventTime), "", format_datetime(LastEventTime, "dd-MM-yyyy"))
+| extend GB_90 = round(Bytes90 / GB, 4)
+| extend GB_per_day_90 = iff(isnull(Bytes90) or Bytes90==0, 0.0, (Bytes90 / 90.0) / GB)
+| extend GB_30_from90 = round(GB_per_day_90 * 30.0, 4)
+| project ['Table Name'] = SrcTable,
+          Billable_90d,
+          LastSeen,
+          GB_90,
+          GB_30_from90
+| order by coalesce(GB_90, 0.0) desc, LastSeen desc
+'@
+$script:kqlResultRows = @()
+$script:universalTable = @{}
+
+function Invoke-LogAnalyticsUsageQuery {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WorkspaceId,
+        [Parameter(Mandatory = $true)]
+        [string]$Query
+    )
+
+    if ([string]::IsNullOrWhiteSpace($WorkspaceId)) {
+        Write-Warning "Cannot execute Log Analytics query because the workspace ID is missing."
+        return $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Query)) {
+        Write-Warning "Cannot execute Log Analytics query because the query text is empty."
+        return $null
+    }
+
+    if (-not $script:accessToken) {
+        Write-Warning "Cannot execute Log Analytics query because an access token is not available."
+        return $null
+    }
+
+    $uri = "https://api.loganalytics.io/v1/workspaces/$WorkspaceId/query"
+    $body = @{ query = $Query } | ConvertTo-Json -Depth 5
+    $headers = @{
+        Authorization = "Bearer $($script:accessToken)"
+        "Content-Type" = "application/json"
+    }
+
+    $elapsed = if ($script:scriptStopwatch) { $script:scriptStopwatch.Elapsed } else { [TimeSpan]::Zero }
+    Write-Host ("[{0:hh\:mm\:ss}] Executing Log Analytics usage query for workspace {1}" -f $elapsed, $WorkspaceId) -ForegroundColor Cyan
+
+    try {
+        return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -ContentType "application/json"
+    }
+    catch {
+        $errorElapsed = if ($script:scriptStopwatch) { $script:scriptStopwatch.Elapsed } else { [TimeSpan]::Zero }
+        Write-Host ("[{0:hh\:mm\:ss}] ERROR executing Log Analytics query: {1}" -f $errorElapsed, $_.Exception.Message) -ForegroundColor Red
+        return $null
+    }
+}
+
+function Convert-LogAnalyticsResponseToRows {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Response
+    )
+
+    $rows = @()
+    if (-not $Response) {
+        return $rows
+    }
+
+    if (-not $Response.tables) {
+        return $rows
+    }
+
+    foreach ($table in $Response.tables) {
+        if (-not $table.columns -or -not $table.rows) {
+            continue
+        }
+
+        $columnNames = @()
+        foreach ($column in $table.columns) {
+            $columnNames += $column.name
+        }
+
+        foreach ($row in $table.rows) {
+            if ($null -eq $row) {
+                continue
+            }
+
+            $rowArray = @($row)
+            $rowData = [ordered]@{}
+
+            for ($index = 0; $index -lt $columnNames.Count; $index++) {
+                $columnName = $columnNames[$index]
+                $value = $null
+                if ($rowArray.Count -gt $index) {
+                    $value = $rowArray[$index]
+                }
+                $rowData[$columnName] = $value
+            }
+
+            $rows += [pscustomobject]$rowData
+        }
+    }
+
+    return $rows
+}
+
+function New-UniversalUsageTable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [array]$Rows
+    )
+
+    $universal = @{}
+
+    foreach ($row in $Rows) {
+        if (-not $row) {
+            continue
+        }
+
+        $tableName = $row.'Table Name'
+        if ([string]::IsNullOrWhiteSpace($tableName)) {
+            continue
+        }
+
+        $universal[$tableName] = [ordered]@{
+            TableName       = $tableName
+            Billable_90d    = $row.Billable_90d
+            LastSeen        = $row.LastSeen
+            GB_90           = [double]$row.GB_90
+            GB_30_from90    = [double]$row.GB_30_from90
+            RetentionDays   = $null
+            Plan            = $null
+            IsDefenderTable = $false
+            Tier            = $null
+            Notes           = $null
+        }
+    }
+
+    return $universal
+}
+
+function Set-UniversalDefenderFlags {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Universal,
+        [Parameter(Mandatory = $true)]
+        [string[]]$DefenderTables
+    )
+
+    if (-not $Universal) {
+        return
+    }
+
+    foreach ($tableName in $DefenderTables) {
+        if ($Universal.ContainsKey($tableName)) {
+            $entry = $Universal[$tableName]
+            if ($entry -is [System.Collections.IDictionary]) {
+                $entry['IsDefenderTable'] = $true
+            }
+        }
+    }
+}
 
 function Disable-WordReport {
     param(
@@ -305,6 +484,31 @@ function Get-AnalysisDefenderData {
         }
         else {
             $planDisplay = 'Unknown'
+        }
+
+        if ($script:universalTable -is [hashtable]) {
+            if ($script:universalTable.ContainsKey($table)) {
+                $entry = $script:universalTable[$table]
+                if ($entry -is [System.Collections.IDictionary]) {
+                    $entry['RetentionDays'] = $retentionPeriod
+                    $entry['Plan'] = $planDisplay
+                    $entry['IsDefenderTable'] = $true
+                }
+            }
+            else {
+                $script:universalTable[$table] = [ordered]@{
+                    TableName       = $table
+                    Billable_90d    = $null
+                    LastSeen        = $null
+                    GB_90           = [double]0
+                    GB_30_from90    = [double]0
+                    RetentionDays   = $retentionPeriod
+                    Plan            = $planDisplay
+                    IsDefenderTable = $true
+                    Tier            = $null
+                    Notes           = $null
+                }
+            }
         }
         $totalControlsTemp = $totalControlsTemp + 1
 
@@ -1212,6 +1416,8 @@ foreach ($env in $environments) {
     $subscriptionId = $env.subscriptionId
     $resourceGroupName = $env.resourceGroupName
     $workspaceName = $env.workspaceName
+    $workspaceId = $env.WorkspaceId
+    $script:currentWorkspaceId = $workspaceId
     write-Host "Starting the analysis for $workspaceName (RG: $resourceGroupName) in subscription $subscriptionId" -ForegroundColor Cyan
     if ($reportRequested) {
         Write-Heading2 -Writer $Writer -HeadingText "$workspaceName"
@@ -1252,7 +1458,31 @@ foreach ($env in $environments) {
         resource      = $resource
     }
     $script:tokenRequestBody = $tokenRequestBody
-    Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
+    $null = Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
+
+    $kqlResultRows = @()
+    $universal = @{}
+
+    if ([string]::IsNullOrWhiteSpace($workspaceId)) {
+        Write-Warning "Workspace ID is not defined for workspace $workspaceName. Skipping Log Analytics usage query."
+        $script:kqlResultRows = @()
+        $script:universalTable = $universal
+    }
+    else {
+        $response = Invoke-LogAnalyticsUsageQuery -WorkspaceId $workspaceId -Query $script:logAnalyticsQuery
+        if ($response) {
+            $kqlResultRows = Convert-LogAnalyticsResponseToRows -Response $response
+            $universal = New-UniversalUsageTable -Rows $kqlResultRows
+            $script:kqlResultRows = $kqlResultRows
+            $script:universalTable = $universal
+            $universal
+        }
+        else {
+            Write-Warning "The Log Analytics query did not return any data for workspace $workspaceName."
+            $script:kqlResultRows = @()
+            $script:universalTable = $universal
+        }
+    }
 
     $defenderTables = @(
         "DeviceInfo",
@@ -1277,6 +1507,10 @@ foreach ($env in $environments) {
         "AlertInfo",
         "AlertEvidence"
     )
+
+    if ($universal.Count -gt 0) {
+        Set-UniversalDefenderFlags -Universal $universal -DefenderTables $defenderTables
+    }
 
     if ($reportRequested) {
         Write-Heading3 -Writer $Writer -HeadingText "Defender data analysis"
