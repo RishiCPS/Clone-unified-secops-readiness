@@ -138,7 +138,7 @@ function Invoke-LogAnalyticsUsageQuery {
     }
 
     $elapsed = if ($script:scriptStopwatch) { $script:scriptStopwatch.Elapsed } else { [TimeSpan]::Zero }
-    Write-Host ("[{0:hh\:mm\:ss}] Executing Log Analytics usage query for workspace {1}" -f $elapsed, $WorkspaceId) -ForegroundColor Cyan
+    Write-Verbose ("[{0:hh\:mm\:ss}] Executing Log Analytics usage query for workspace {1}" -f $elapsed, $WorkspaceId)
 
     try {
         return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -ContentType "application/json"
@@ -179,10 +179,10 @@ function Invoke-LogAnalyticsUsageQuery {
         }
 
         $statusFragment = if ($statusCode) { " (HTTP $statusCode)" } else { "" }
-        Write-Host ("[{0:hh\:mm\:ss}] ERROR executing Log Analytics query{1}: {2}" -f $errorElapsed, $statusFragment, $_.Exception.Message) -ForegroundColor Red
+        Write-Verbose ("[{0:hh\:mm\:ss}] ERROR executing Log Analytics query{1}: {2}" -f $errorElapsed, $statusFragment, $_.Exception.Message)
 
         if ($responseBody) {
-            Write-Host "Response content:`n$responseBody" -ForegroundColor DarkRed
+            Write-Verbose "Response content:`n$responseBody"
         }
 
         return $null
@@ -539,69 +539,108 @@ function Get-AnalysisDefenderData {
 
     foreach ($table in @($Universal.Keys)) {
         $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/tables/${table}?api-version=$apiVersion"
-        Write-Host "Invoking GET $uri"
+
+        $entry = $Universal[$table]
+        $response = $null
+        $retentionPeriod = $null
+        $planDisplay = 'Unknown'
 
         try {
             $response = Invoke-SentinelApi -Uri $uri -ErrorAction Stop
+            $retentionPeriod = $response.properties.totalRetentionInDays
+
+            $plan = $response.properties.plan
+            if ($plan) {
+                if ($plan -is [string]) {
+                    $planDisplay = $plan
+                }
+                else {
+                    $planDisplay = ($plan | ConvertTo-Json -Compress)
+                }
+            }
         }
         catch {
-            Write-Warning "Failed to retrieve data for table $table — $($_.Exception.Message)"
-            continue
-        }
-
-        $retentionPeriod = $response.properties.totalRetentionInDays
-        $plan = $response.properties.plan
-
-        if ($plan) {
-            if ($plan -is [string]) {
-                $planDisplay = $plan
-            }
-            else {
-                $planDisplay = ($plan | ConvertTo-Json -Compress)
-            }
-        }
-        else {
             $planDisplay = 'Unknown'
         }
 
-        $entry = $Universal[$table]
         if ($entry -is [System.Collections.IDictionary]) {
             $entry['RetentionDays'] = $retentionPeriod
-            $entry['Plan'] = $plan
+            $entry['Plan'] = $planDisplay
         }
 
-        $totalControlsTemp = $totalControlsTemp + 1
+        $retentionDisplay = if ($null -ne $retentionPeriod) { $retentionPeriod } else { 'Unknown' }
+        $planText = if ([string]::IsNullOrWhiteSpace($planDisplay)) { 'Unknown' } else { $planDisplay }
 
-        if ($retentionPeriod -lt 31) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionPeriod days - no need to ingest this data in Sentinel"
-            if ($reportRequested) {
-                Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
-                $Writer.TypeText("[WARNING] ")
-                Set-WriterStyle -Writer $Writer -Color 0 -Bold $false
-                $Writer.TypeText("The table ")
-                Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
-                $Writer.TypeText($table)
-                Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
-                $Writer.Font.Bold = $false
-                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionPeriod days - no need to ingest this data in Sentinel")
-                $Writer.TypeParagraph()
-            }
+        $isDef = if ($entry -and $entry.ContainsKey('IsDefenderTable')) { $entry['IsDefenderTable'] } else { 'Unknown' }
+        $billable = if ($entry -and $entry.ContainsKey('Billable_90d')) { $entry['Billable_90d'] } else { 'Unknown' }
+        $lastSeen = if ($entry -and $entry.ContainsKey('LastSeen')) { $entry['LastSeen'] } else { 'Unknown' }
+        $gb90 = if ($entry -and $entry.ContainsKey('GB_90')) { $entry['GB_90'] } else { 'Unknown' }
+        $gb30 = if ($entry -and $entry.ContainsKey('GB_30_from90')) { $entry['GB_30_from90'] } else { 'Unknown' }
+
+        $totalControlsTemp++
+
+        $statusLabel = '[WARNING]'
+        $statusColor = 'Yellow'
+        $summaryText = " The table $table (plan: $planText) has a retention of $retentionDisplay days — retention information couldn't be fully retrieved."
+
+        if ($null -ne $retentionPeriod -and $retentionPeriod -ge 90) {
+            $statusLabel = '[OK]'
+            $statusColor = 'Green'
+            $summaryText = " The table $table (plan: $planText) has a retention of $retentionDisplay days — data should remain stored in Sentinel for ongoing retention."
+            $passedControlsTemp++
         }
-        else {
-            Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention"
-            $passedControlsTemp = $passedControlsTemp + 1
-            if ($reportRequested) {
+        elseif ($null -ne $retentionPeriod) {
+            $summaryText = " The table $table (plan: $planText) has a retention of $retentionDisplay days — no need to ingest this data in Sentinel."
+        }
+
+        if ($reportRequested) {
+            if ($statusLabel -eq '[OK]') {
                 Set-WriterStyle -Writer $Writer -Color 5287936 -Bold $true
-                $Writer.TypeText("[OK] ")
-                Set-WriterStyle -Writer $Writer -Color 0 -Bold $false
-                $Writer.TypeText(" The table ")
-                Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
-                $Writer.TypeText($table)
-                Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
-                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention")
-                $Writer.TypeParagraph()
             }
+            else {
+                Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
+            }
+
+            $Writer.TypeText("$statusLabel ")
+            Set-WriterStyle -Writer $Writer -Color 0 -Bold $false
+            $Writer.TypeText("The table ")
+            Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
+            $Writer.TypeText($table)
+            Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
+            $Writer.Font.Bold = $false
+            $Writer.TypeText(" (plan: $planText) has a retention of $retentionDisplay days")
+
+            if ($statusLabel -eq '[OK]') {
+                $Writer.TypeText(" — data should remain stored in Sentinel for ongoing retention.")
+            }
+            elseif ($null -ne $retentionPeriod) {
+                $Writer.TypeText(" — no need to ingest this data in Sentinel.")
+            }
+            else {
+                $Writer.TypeText(" — retention information couldn't be fully retrieved.")
+            }
+
+            $Writer.TypeParagraph()
         }
+
+        Write-Host $statusLabel -ForegroundColor $statusColor -NoNewline
+        Write-Host $summaryText -ForegroundColor White
+
+        Write-Host "  ↳ " -ForegroundColor White -NoNewline
+        Write-Host "IsDefenderTable: " -ForegroundColor Cyan -NoNewline
+        Write-Host ("{0}" -f $isDef) -ForegroundColor White -NoNewline
+        Write-Host " | " -ForegroundColor DarkGray -NoNewline
+        Write-Host "Billable_90d: " -ForegroundColor Cyan -NoNewline
+        Write-Host ("{0}" -f $billable) -ForegroundColor White -NoNewline
+        Write-Host " | " -ForegroundColor DarkGray -NoNewline
+        Write-Host "LastSeen: " -ForegroundColor Cyan -NoNewline
+        Write-Host ("{0}" -f $lastSeen) -ForegroundColor White -NoNewline
+        Write-Host " | " -ForegroundColor DarkGray -NoNewline
+        Write-Host "GB_90: " -ForegroundColor Cyan -NoNewline
+        Write-Host ("{0}" -f $gb90) -ForegroundColor White -NoNewline
+        Write-Host " | " -ForegroundColor DarkGray -NoNewline
+        Write-Host "GB_30_from90: " -ForegroundColor Cyan -NoNewline
+        Write-Host ("{0}" -f $gb30) -ForegroundColor White
     }
 
     return $totalControlsTemp, $passedControlsTemp
@@ -1328,7 +1367,7 @@ function Request-AccessToken {
     )
 
     $elapsed = $script:scriptStopwatch.Elapsed
-    Write-Host ("[{0:hh\:mm\:ss}] Requesting new access token" -f $elapsed) -ForegroundColor Cyan
+    Write-Verbose ("[{0:hh\:mm\:ss}] Requesting new access token" -f $elapsed)
 
     $tokenResponse = Invoke-RestMethod -Method Post -Uri $AuthUrl -Body $TokenRequestBody
     $script:accessToken = $tokenResponse.access_token
@@ -1376,7 +1415,7 @@ function Request-LogAnalyticsAccessToken {
     )
 
     $elapsed = $script:scriptStopwatch.Elapsed
-    Write-Host ("[{0:hh\:mm\:ss}] Requesting new Log Analytics access token" -f $elapsed) -ForegroundColor Cyan
+    Write-Verbose ("[{0:hh\:mm\:ss}] Requesting new Log Analytics access token" -f $elapsed)
 
     $tokenResponse = Invoke-RestMethod -Method Post -Uri $AuthUrl -Body $TokenRequestBody
     $script:logAnalyticsAccessToken = $tokenResponse.access_token
@@ -1440,7 +1479,7 @@ function Invoke-SentinelApi {
         }
 
         $elapsed = $script:scriptStopwatch.Elapsed
-        Write-Host ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri) -ForegroundColor Yellow
+        Write-Verbose ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri)
 
         try {
             if ($null -ne $Body) {
@@ -1464,12 +1503,12 @@ function Invoke-SentinelApi {
 
             $shouldRetry = $false
             if ($statusCode -eq 401 -and $attempt -lt $maxAttempts -and $script:authUrl -and $script:tokenRequestBody) {
-                Write-Host ("[{0:hh\:mm\:ss}] Access token expired. Requesting a new token." -f $errorElapsed) -ForegroundColor DarkYellow
+                Write-Verbose ("[{0:hh\:mm\:ss}] Access token expired. Requesting a new token." -f $errorElapsed)
                 Request-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
                 $shouldRetry = $true
             }
             elseif ($_.Exception.Message -match 'token' -and $_.Exception.Message -match 'expired' -and $attempt -lt $maxAttempts -and $script:authUrl -and $script:tokenRequestBody) {
-                Write-Host ("[{0:hh\:mm\:ss}] Token reported as expired. Requesting a new token." -f $errorElapsed) -ForegroundColor DarkYellow
+                Write-Verbose ("[{0:hh\:mm\:ss}] Token reported as expired. Requesting a new token." -f $errorElapsed)
                 Request-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
                 $shouldRetry = $true
             }
@@ -1478,7 +1517,7 @@ function Invoke-SentinelApi {
                 continue
             }
 
-            Write-Host ("[{0:hh\:mm\:ss}] ERROR during {1} {2}: {3}" -f $errorElapsed, $Method.ToUpper(), $Uri, $_.Exception.Message) -ForegroundColor Red
+            Write-Verbose ("[{0:hh\:mm\:ss}] ERROR during {1} {2}: {3}" -f $errorElapsed, $Method.ToUpper(), $Uri, $_.Exception.Message)
             throw
         }
     }
