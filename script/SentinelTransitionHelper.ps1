@@ -66,6 +66,7 @@ $script:reportWasRequested = $false
 Set-Variable -Scope Script -Name WordApplication -Value $null
 Set-Variable -Scope Script -Name Document -Value $null
 Set-Variable -Scope Script -Name Writer -Value ([NullWordSelection]::new())
+Set-Variable -Scope Script -Name lastSentinelApiStatusCode -Value $null
 $script:currentWorkspaceId = $null
 $script:logAnalyticsQuery = @'
 let GB = 1024.0 * 1024 * 1024;
@@ -137,15 +138,12 @@ function Invoke-LogAnalyticsUsageQuery {
         "Content-Type" = "application/json"
     }
 
-    $elapsed = if ($script:scriptStopwatch) { $script:scriptStopwatch.Elapsed } else { [TimeSpan]::Zero }
-    Write-Host ("[{0:hh\:mm\:ss}] Executing Log Analytics usage query for workspace {1}" -f $elapsed, $WorkspaceId) -ForegroundColor Cyan
+    Write-Host "Executing Log Analytics usage query for workspace $WorkspaceId" -ForegroundColor Cyan
 
     try {
         return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body -ContentType "application/json"
     }
     catch {
-        $errorElapsed = if ($script:scriptStopwatch) { $script:scriptStopwatch.Elapsed } else { [TimeSpan]::Zero }
-
         $statusCode = $null
         $responseBody = $null
 
@@ -179,7 +177,7 @@ function Invoke-LogAnalyticsUsageQuery {
         }
 
         $statusFragment = if ($statusCode) { " (HTTP $statusCode)" } else { "" }
-        Write-Host ("[{0:hh\:mm\:ss}] ERROR executing Log Analytics query{1}: {2}" -f $errorElapsed, $statusFragment, $_.Exception.Message) -ForegroundColor Red
+        Write-Warning "Log Analytics query failed$statusFragment: $($_.Exception.Message)"
 
         if ($responseBody) {
             Write-Host "Response content:`n$responseBody" -ForegroundColor DarkRed
@@ -306,6 +304,130 @@ function Set-UniversalDefenderFlags {
                 $entry['IsDefenderTable'] = $false
             }
         }
+    }
+}
+
+function Get-TableMetadataSoft {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SubscriptionId,
+        [Parameter(Mandatory = $true)]
+        [string]$ResourceGroupName,
+        [Parameter(Mandatory = $true)]
+        [string]$WorkspaceName,
+        [Parameter(Mandatory = $true)]
+        [string]$TableName,
+        [Parameter(Mandatory = $true)]
+        [string]$ApiVersion,
+        [Parameter(Mandatory = $false)]
+        [int]$MaxAttempts = 3
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TableName)) {
+        return [pscustomobject]@{
+            Response      = $null
+            Plan          = 'Unknown'
+            RetentionDays = $null
+            Notes         = 'API lookup failed'
+        }
+    }
+
+    $uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$WorkspaceName/tables/$TableName?api-version=$ApiVersion"
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
+
+        $headers = @{}
+        foreach ($item in $script:header.GetEnumerator()) {
+            $headers[$item.Key] = $item.Value
+        }
+
+        try {
+            $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+
+            $plan = $null
+            $retentionDays = $null
+
+            if ($response -and $response.PSObject.Properties.Match('properties').Count -gt 0) {
+                $properties = $response.properties
+
+                if ($properties -and $properties.PSObject.Properties.Match('plan').Count -gt 0) {
+                    $plan = $properties.plan
+                }
+
+                if ($properties -and $properties.PSObject.Properties.Match('totalRetentionInDays').Count -gt 0) {
+                    $retentionRaw = $properties.totalRetentionInDays
+                    if ($null -ne $retentionRaw) {
+                        if ($retentionRaw -is [int]) {
+                            $retentionDays = $retentionRaw
+                        }
+                        elseif ($retentionRaw -is [long]) {
+                            $retentionDays = [int]$retentionRaw
+                        }
+                        elseif ($retentionRaw -is [double]) {
+                            $retentionDays = [int][Math]::Round($retentionRaw, 0, [MidpointRounding]::AwayFromZero)
+                        }
+                        else {
+                            $parsedRetention = 0
+                            if ([int]::TryParse($retentionRaw.ToString(), [ref]$parsedRetention)) {
+                                $retentionDays = $parsedRetention
+                            }
+                        }
+                    }
+                }
+            }
+
+            return [pscustomobject]@{
+                Response      = $response
+                Plan          = if ($plan) { $plan } else { 'Unknown' }
+                RetentionDays = $retentionDays
+                Notes         = $null
+            }
+        }
+        catch {
+            $statusCode = $null
+            if ($_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
+                try {
+                    $statusCode = [int]$_.Exception.Response.StatusCode
+                }
+                catch {
+                    try {
+                        $statusCode = [int]$_.Exception.Response.StatusCode.value__
+                    }
+                    catch {
+                        $statusCode = $null
+                    }
+                }
+            }
+
+            $shouldRetry = $false
+            if ($statusCode -eq 429 -or ($statusCode -ge 500 -and $statusCode -lt 600)) {
+                if ($attempt -lt $MaxAttempts) {
+                    $shouldRetry = $true
+                    $delaySeconds = [Math]::Min(5, [Math]::Pow(2, $attempt - 1))
+                    Start-Sleep -Seconds $delaySeconds
+                }
+            }
+
+            if ($shouldRetry) {
+                continue
+            }
+
+            Write-Warning "Table metadata lookup failed for $TableName. Using defaults."
+            return [pscustomobject]@{
+                Response      = $null
+                Plan          = 'Unknown'
+                RetentionDays = $null
+                Notes         = 'API lookup failed'
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Response      = $null
+        Plan          = 'Unknown'
+        RetentionDays = $null
+        Notes         = 'API lookup failed'
     }
 }
 
@@ -537,70 +659,163 @@ function Get-AnalysisDefenderData {
         return $totalControlsTemp, $passedControlsTemp
     }
 
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+
     foreach ($table in @($Universal.Keys)) {
-        $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/tables/${table}?api-version=$apiVersion"
-        Write-Host "Invoking GET $uri"
+        $totalControlsTemp++
 
-        try {
-            $response = Invoke-SentinelApi -Uri $uri -ErrorAction Stop
-        }
-        catch {
-            Write-Warning "Failed to retrieve data for table $table — $($_.Exception.Message)"
-            continue
+        $entry = $Universal[$table]
+        if (-not ($entry -is [System.Collections.IDictionary])) {
+            $entry = [ordered]@{}
+            $Universal[$table] = $entry
         }
 
-        $retentionPeriod = $response.properties.totalRetentionInDays
-        $plan = $response.properties.plan
+        $metadata = Get-TableMetadataSoft -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -WorkspaceName $workspaceName -TableName $table -ApiVersion $apiVersion
 
-        if ($plan) {
-            if ($plan -is [string]) {
-                $planDisplay = $plan
+        if ($entry -is [System.Collections.IDictionary]) {
+            $entry['Plan'] = $metadata.Plan
+            $entry['RetentionDays'] = $metadata.RetentionDays
+            $entry['Notes'] = $metadata.Notes
+        }
+
+        $planValue = if ($entry.Contains('Plan')) { $entry['Plan'] } else { $null }
+        $planDisplay = 'Unknown'
+        if ($planValue) {
+            if ($planValue -is [string]) {
+                if (-not [string]::IsNullOrWhiteSpace($planValue)) {
+                    $planDisplay = $planValue
+                }
             }
             else {
-                $planDisplay = ($plan | ConvertTo-Json -Compress)
+                try {
+                    $planDisplay = ($planValue | ConvertTo-Json -Compress)
+                }
+                catch {
+                    $planDisplay = $planValue.ToString()
+                }
             }
         }
-        else {
+
+        if ([string]::IsNullOrWhiteSpace($planDisplay)) {
             $planDisplay = 'Unknown'
         }
 
-        $entry = $Universal[$table]
-        if ($entry -is [System.Collections.IDictionary]) {
-            $entry['RetentionDays'] = $retentionPeriod
-            $entry['Plan'] = $plan
+        $retentionValue = if ($entry.Contains('RetentionDays')) { $entry['RetentionDays'] } else { $null }
+        $retentionNumeric = $null
+        if ($null -ne $retentionValue) {
+            if ($retentionValue -is [int]) {
+                $retentionNumeric = $retentionValue
+            }
+            elseif ($retentionValue -is [long]) {
+                $retentionNumeric = [int]$retentionValue
+            }
+            elseif ($retentionValue -is [double]) {
+                $retentionNumeric = [int][Math]::Round($retentionValue, 0, [MidpointRounding]::AwayFromZero)
+            }
+            elseif ($retentionValue -is [string]) {
+                if (-not [string]::IsNullOrWhiteSpace($retentionValue)) {
+                    $parsedRetention = 0
+                    if ([int]::TryParse($retentionValue, [ref]$parsedRetention)) {
+                        $retentionNumeric = $parsedRetention
+                    }
+                }
+            }
         }
 
-        $totalControlsTemp = $totalControlsTemp + 1
+        $retentionDisplay = 'Unknown'
+        if ($null -ne $retentionNumeric) {
+            $retentionDisplay = $retentionNumeric
+        }
+        elseif ($null -ne $retentionValue -and -not [string]::IsNullOrWhiteSpace([string]$retentionValue)) {
+            $retentionDisplay = $retentionValue
+        }
 
-        if ($retentionPeriod -lt 31) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionPeriod days - no need to ingest this data in Sentinel"
-            if ($reportRequested) {
-                Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
-                $Writer.TypeText("[WARNING] ")
-                Set-WriterStyle -Writer $Writer -Color 0 -Bold $false
-                $Writer.TypeText("The table ")
-                Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
-                $Writer.TypeText($table)
-                Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
-                $Writer.Font.Bold = $false
-                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionPeriod days - no need to ingest this data in Sentinel")
-                $Writer.TypeParagraph()
+        $billableValue = if ($entry.Contains('Billable_90d')) { $entry['Billable_90d'] } else { $null }
+        $billableDisplay = if (-not [string]::IsNullOrWhiteSpace([string]$billableValue)) { $billableValue } else { 'Unknown' }
+
+        $lastSeenValue = if ($entry.Contains('LastSeen')) { $entry['LastSeen'] } else { $null }
+        $lastSeenDisplay = if (-not [string]::IsNullOrWhiteSpace([string]$lastSeenValue)) { $lastSeenValue } else { 'Unknown' }
+
+        $gb90Value = if ($entry.Contains('GB_90')) { $entry['GB_90'] } else { 0 }
+        if ($null -eq $gb90Value) { $gb90Value = 0 }
+        $gb30Value = if ($entry.Contains('GB_30_from90')) { $entry['GB_30_from90'] } else { 0 }
+        if ($null -eq $gb30Value) { $gb30Value = 0 }
+
+        $numberStyle = [System.Globalization.NumberStyles]::Float -bor [System.Globalization.NumberStyles]::AllowThousands
+
+        $gb90Display = '0'
+        if ($null -ne $gb90Value) {
+            $gb90Text = [string]$gb90Value
+            $gb90Numeric = 0.0
+            if ([double]::TryParse($gb90Text, $numberStyle, $culture, [ref]$gb90Numeric)) {
+                $gb90Display = [string]::Format($culture, "{0:0.####}", $gb90Numeric)
             }
+            elseif (-not [string]::IsNullOrWhiteSpace($gb90Text)) {
+                $gb90Display = $gb90Text
+            }
+        }
+
+        $gb30Display = '0'
+        if ($null -ne $gb30Value) {
+            $gb30Text = [string]$gb30Value
+            $gb30Numeric = 0.0
+            if ([double]::TryParse($gb30Text, $numberStyle, $culture, [ref]$gb30Numeric)) {
+                $gb30Display = [string]::Format($culture, "{0:0.####}", $gb30Numeric)
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($gb30Text)) {
+                $gb30Display = $gb30Text
+            }
+        }
+
+        $isDefValue = if ($entry.Contains('IsDefenderTable')) { $entry['IsDefenderTable'] } else { $false }
+        if ($null -eq $isDefValue) { $isDefValue = $false }
+
+        $isOk = $false
+        if ($null -ne $retentionNumeric) {
+            if ($retentionNumeric -ge 90) {
+                $isOk = $true
+            }
+        }
+
+        if ($isOk) {
+            Write-Host "[OK]" -ForegroundColor Green -NoNewline
+            Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionDisplay days — data should remain stored in Sentinel for ongoing retention." -ForegroundColor White
+            $passedControlsTemp++
         }
         else {
-            Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention"
-            $passedControlsTemp = $passedControlsTemp + 1
-            if ($reportRequested) {
-                Set-WriterStyle -Writer $Writer -Color 5287936 -Bold $true
-                $Writer.TypeText("[OK] ")
-                Set-WriterStyle -Writer $Writer -Color 0 -Bold $false
-                $Writer.TypeText(" The table ")
-                Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
-                $Writer.TypeText($table)
-                Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
-                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionPeriod days - need to be stored in Sentinel for more retention")
-                $Writer.TypeParagraph()
+            Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline
+            Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionDisplay days — no need to ingest this data in Sentinel." -ForegroundColor White
+        }
+
+        Write-Host "  ↳ " -NoNewline
+        Write-Host "IsDefenderTable: " -ForegroundColor Cyan -NoNewline
+        Write-Host "$isDefValue" -ForegroundColor White -NoNewline
+        Write-Host " | Billable_90d: " -ForegroundColor Cyan -NoNewline
+        Write-Host "$billableDisplay" -ForegroundColor White -NoNewline
+        Write-Host " | LastSeen: " -ForegroundColor Cyan -NoNewline
+        Write-Host "$lastSeenDisplay" -ForegroundColor White -NoNewline
+        Write-Host " | GB_90: " -ForegroundColor Cyan -NoNewline
+        Write-Host "$gb90Display" -ForegroundColor White -NoNewline
+        Write-Host " | GB_30_from90: " -ForegroundColor Cyan -NoNewline
+        Write-Host "$gb30Display" -ForegroundColor White
+
+        if ($reportRequested) {
+            $statusLabel = if ($isOk) { '[OK]' } else { '[WARNING]' }
+            $statusColor = if ($isOk) { 5287936 } else { 255 }
+            Set-WriterStyle -Writer $Writer -Color $statusColor -Bold $true
+            $Writer.TypeText("$statusLabel ")
+            Set-WriterStyle -Writer $Writer -Color 0 -Bold $false
+            $Writer.TypeText("The table ")
+            Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
+            $Writer.TypeText($table)
+            Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
+            if ($isOk) {
+                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionDisplay days — data should remain stored in Sentinel for ongoing retention.")
             }
+            else {
+                $Writer.TypeText(" (plan: $planDisplay) has a retention of $retentionDisplay days — no need to ingest this data in Sentinel.")
+            }
+            $Writer.TypeParagraph()
         }
     }
 
@@ -622,19 +837,31 @@ function Get-AnalyticsAnalysis {
     $response = Invoke-SentinelApi -Uri $uri
     $totalControlsTemp++
 
-    if ($response -eq $null) {
-        Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The Fusion engine is not enabled"
-        $passedControlsTemp++
-        if ($reportRequested) {
-            Set-WriterStyle -Writer $Writer -Color 5287936 -Bold $true
-            $Writer.TypeText("[OK] ")
-            Set-WriterStyle -Writer $Writer -Bold $false -Color 0
-            $Writer.TypeText("The Fusion engine is not enabled")
-            $Writer.TypeParagraph()
+    if (-not $response) {
+        if ($script:lastSentinelApiStatusCode -eq 404) {
+            Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The Fusion engine is not enabled"
+            $passedControlsTemp++
+            if ($reportRequested) {
+                Set-WriterStyle -Writer $Writer -Color 5287936 -Bold $true
+                $Writer.TypeText("[OK] ")
+                Set-WriterStyle -Writer $Writer -Bold $false -Color 0
+                $Writer.TypeText("The Fusion engine is not enabled")
+                $Writer.TypeParagraph()
+            }
+        }
+        else {
+            Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline; Write-Host " Unable to verify the Fusion engine status at this time"
+            if ($reportRequested) {
+                Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
+                $Writer.TypeText("[WARNING] ")
+                Set-WriterStyle -Writer $Writer -Bold $false -Color 0
+                $Writer.TypeText("Unable to verify the Fusion engine status at this time")
+                $Writer.TypeParagraph()
+            }
         }
     }
-    if ($response.properties.enabled) {
-        Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " Fusion rules will be automatically disabled after Microsoft Sentinel is onboarded in Defender"
+    elseif ($response.properties -and $response.properties.enabled) {
+        Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline; Write-Host " Fusion rules will be automatically disabled after Microsoft Sentinel is onboarded in Defender"
         if ($reportRequested) {
             Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
             $Writer.TypeText("[WARNING] ")
@@ -645,8 +872,8 @@ function Get-AnalyticsAnalysis {
     }
     else {
         Write-Host "[OK]" -ForegroundColor Green -NoNewline; Write-Host " The Fusion engine is not enabled"
+        $passedControlsTemp++
         if ($reportRequested) {
-            $passedControlsTemp++
             Set-WriterStyle -Writer $Writer -Color 5287936 -Bold $true
             $Writer.TypeText("[OK] ")
             Set-WriterStyle -Writer $Writer -Bold $false -Color 0
@@ -660,16 +887,21 @@ function Get-AnalyticsAnalysis {
     $apiVersion = "2025-06-01"
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/alertRules?api-version=$apiVersion"
     $response = Invoke-SentinelApi -Uri $uri
+    if (-not $response -or -not $response.value) {
+        Write-Warning "Analytics rules could not be retrieved. Skipping analytics rule checks."
+        return $totalControlsTemp, $passedControlsTemp
+    }
+
     foreach ($rule in $response.value) {
         if ($rule.properties.displayName -eq "Advanced Multistage Attack Detection") {
             continue
         }
         $totalControlsTemp++
-    
+
         $ruleName = $($rule.properties.displayName)
-    
+
         if (!$rule.properties.incidentConfiguration.createIncident) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The rule $ruleName doesn't generate incidents. The alerts aren't visible in the Defender portal. They appear in SecurityAlerts table in Advanced Hunting"
+            Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline; Write-Host " The rule $ruleName doesn't generate incidents. The alerts aren't visible in the Defender portal. They appear in SecurityAlerts table in Advanced Hunting"
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
                 $Writer.TypeText("[WARNING] ")
@@ -715,6 +947,11 @@ function Get-AutomationAnalysis {
     $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/providers/Microsoft.SecurityInsights/automationRules?api-version=$apiVersion"
     $response = Invoke-SentinelApi -Uri $uri
 
+    if (-not $response -or -not $response.value) {
+        Write-Warning "Automation rules could not be retrieved. Skipping automation analysis."
+        return $totalControlsTemp, $passedControlsTemp
+    }
+
     # Iterate through automation rules
     foreach ($rule in $response.value) {
         $totalControlsTemp++
@@ -754,7 +991,7 @@ function Get-AutomationAnalysis {
     
         $ruleName = $($rule.properties.displayName)
         if ($incidentTitle) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " Change the trigger condition in the automation rule $ruleName from `"Incident Title`" to `"Analytics Rule Name`""
+            Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline; Write-Host " Change the trigger condition in the automation rule $ruleName from `"Incident Title`" to `"Analytics Rule Name`""
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
                 $Writer.TypeText("[WARNING] ")
@@ -775,7 +1012,7 @@ function Get-AutomationAnalysis {
             }
         }
         if ($incidentProvider) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " Change the trigger condition in the automation rule $ruleName from `"Incident Provider`" to `"Alert Product Name`""
+            Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline; Write-Host " Change the trigger condition in the automation rule $ruleName from `"Incident Provider`" to `"Alert Product Name`""
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
                 $Writer.TypeText("[WARNING] ")
@@ -796,7 +1033,7 @@ function Get-AutomationAnalysis {
             }
         }
         if ($fusionMentioned) {
-            Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The automation rule $ruleName is triggered by Fusion incidents. After Sentinel is onboarded in Defender, Fusion will be disabled and this rule won't be triggered anymore"
+            Write-Host "[WARNING]" -ForegroundColor Yellow -NoNewline; Write-Host " The automation rule $ruleName is triggered by Fusion incidents. After Sentinel is onboarded in Defender, Fusion will be disabled and this rule won't be triggered anymore"
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
                 $Writer.TypeText("[WARNING] ")
@@ -1327,8 +1564,7 @@ function Request-AccessToken {
         [hashtable]$TokenRequestBody
     )
 
-    $elapsed = $script:scriptStopwatch.Elapsed
-    Write-Host ("[{0:hh\:mm\:ss}] Requesting new access token" -f $elapsed) -ForegroundColor Cyan
+    Write-Host "Requesting new access token" -ForegroundColor Cyan
 
     $tokenResponse = Invoke-RestMethod -Method Post -Uri $AuthUrl -Body $TokenRequestBody
     $script:accessToken = $tokenResponse.access_token
@@ -1375,8 +1611,7 @@ function Request-LogAnalyticsAccessToken {
         [hashtable]$TokenRequestBody
     )
 
-    $elapsed = $script:scriptStopwatch.Elapsed
-    Write-Host ("[{0:hh\:mm\:ss}] Requesting new Log Analytics access token" -f $elapsed) -ForegroundColor Cyan
+    Write-Host "Requesting new Log Analytics access token" -ForegroundColor Cyan
 
     $tokenResponse = Invoke-RestMethod -Method Post -Uri $AuthUrl -Body $TokenRequestBody
     $script:logAnalyticsAccessToken = $tokenResponse.access_token
@@ -1421,11 +1656,14 @@ function Invoke-SentinelApi {
         [Parameter(Mandatory = $false)]
         [object]$Body = $null,
         [Parameter(Mandatory = $false)]
-        [hashtable]$AdditionalHeaders = $null
+        [hashtable]$AdditionalHeaders = $null,
+        [Parameter(Mandatory = $false)]
+        [switch]$FailHard
     )
 
     $maxAttempts = 2
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $script:lastSentinelApiStatusCode = $null
         Ensure-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
 
         $effectiveHeaders = @{}
@@ -1439,49 +1677,66 @@ function Invoke-SentinelApi {
             }
         }
 
-        $elapsed = $script:scriptStopwatch.Elapsed
-        Write-Host ("[{0:hh\:mm\:ss}] Invoking {1} {2}" -f $elapsed, $Method.ToUpper(), $Uri) -ForegroundColor Yellow
-
         try {
             if ($null -ne $Body) {
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders -Body $Body
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders -Body $Body
+                $script:lastSentinelApiStatusCode = 200
+                return $result
             }
             else {
-                return Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders
+                $result = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $effectiveHeaders
+                $script:lastSentinelApiStatusCode = 200
+                return $result
             }
         }
         catch {
-            $errorElapsed = $script:scriptStopwatch.Elapsed
             $statusCode = $null
             if ($_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
                 try {
                     $statusCode = [int]$_.Exception.Response.StatusCode.Value__
                 }
                 catch {
-                    $statusCode = $null
+                    try {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                    }
+                    catch {
+                        $statusCode = $null
+                    }
                 }
             }
 
             $shouldRetry = $false
             if ($statusCode -eq 401 -and $attempt -lt $maxAttempts -and $script:authUrl -and $script:tokenRequestBody) {
-                Write-Host ("[{0:hh\:mm\:ss}] Access token expired. Requesting a new token." -f $errorElapsed) -ForegroundColor DarkYellow
                 Request-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
                 $shouldRetry = $true
             }
             elseif ($_.Exception.Message -match 'token' -and $_.Exception.Message -match 'expired' -and $attempt -lt $maxAttempts -and $script:authUrl -and $script:tokenRequestBody) {
-                Write-Host ("[{0:hh\:mm\:ss}] Token reported as expired. Requesting a new token." -f $errorElapsed) -ForegroundColor DarkYellow
                 Request-AccessToken -AuthUrl $script:authUrl -TokenRequestBody $script:tokenRequestBody
                 $shouldRetry = $true
+            }
+            elseif ($statusCode -eq 429 -or ($statusCode -ge 500 -and $statusCode -lt 600)) {
+                if ($attempt -lt $maxAttempts) {
+                    $shouldRetry = $true
+                    $delaySeconds = [Math]::Min(5, [Math]::Pow(2, $attempt - 1))
+                    Start-Sleep -Seconds $delaySeconds
+                }
             }
 
             if ($shouldRetry) {
                 continue
             }
 
-            Write-Host ("[{0:hh\:mm\:ss}] ERROR during {1} {2}: {3}" -f $errorElapsed, $Method.ToUpper(), $Uri, $_.Exception.Message) -ForegroundColor Red
-            throw
+            $script:lastSentinelApiStatusCode = $statusCode
+            Write-Warning "Azure request failed while performing the $Method operation: $($_.Exception.Message)"
+            if ($FailHard.IsPresent) {
+                throw
+            }
+
+            return $null
         }
     }
+
+    return $null
 }
 
 $resource = "https://management.azure.com/"
