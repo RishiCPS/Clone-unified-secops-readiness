@@ -61,6 +61,22 @@ class NullWordSelection {
     [void]Paste() {}
 }
 
+$script:currentReportSection = 'Initialization'
+
+function Set-CurrentReportSection {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        $script:currentReportSection = 'Unknown section'
+    }
+    else {
+        $script:currentReportSection = $Name
+    }
+}
+
 $script:wordAutomationDisabled = $false
 $script:reportWasRequested = $false
 Set-Variable -Scope Script -Name WordApplication -Value $null
@@ -395,9 +411,87 @@ function Set-WriterStyle {
         [bool]$Bold = $false,
         [bool]$Italic = $false
     )
-    $Writer.Font.Color = $Color
-    $Writer.Font.Bold = $Bold
-    $Writer.Font.Italic = $Italic
+    if (-not $Writer) {
+        return
+    }
+
+    $section = if ($script:currentReportSection) { $script:currentReportSection } else { 'Unknown section' }
+
+    try {
+        $font = $Writer.Font
+    }
+    catch {
+        $message = "Failed to access the Word font object while processing the '$section' section. $($_.Exception.Message)"
+        throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $message)
+    }
+
+    if (-not $font) {
+        $message = "Failed to access the Word font object while processing the '$section' section because the font reference was null."
+        throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $message)
+    }
+
+    if ($PSBoundParameters.ContainsKey('Color')) {
+        try {
+            if ($font -is [NullWordFont]) {
+                $font.Color = $Color
+            }
+            elseif ($font.PSObject.Properties.Match('Color')) {
+                $font.Color = $Color
+            }
+            elseif ($font.PSObject.Properties.Match('TextColor')) {
+                $textColor = $font.TextColor
+                if ($textColor -and $textColor.PSObject.Properties.Match('RGB')) {
+                    $textColor.RGB = $Color
+                }
+                else {
+                    throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList "The TextColor property does not expose an RGB member.")
+                }
+            }
+            else {
+                $fontType = $font.GetType().FullName
+                $detail = "The font object type '$fontType' does not expose a Color or TextColor property."
+                throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $detail)
+            }
+        }
+        catch {
+            $message = "Failed to set the font color while processing the '$section' section. $($_.Exception.Message)"
+            throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $message)
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('Bold')) {
+        try {
+            if ($font.PSObject.Properties.Match('Bold')) {
+                $font.Bold = $Bold
+            }
+            else {
+                $fontType = $font.GetType().FullName
+                $detail = "The font object type '$fontType' does not expose a Bold property."
+                throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $detail)
+            }
+        }
+        catch {
+            $message = "Failed to set the font boldness while processing the '$section' section. $($_.Exception.Message)"
+            throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $message)
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('Italic')) {
+        try {
+            if ($font.PSObject.Properties.Match('Italic')) {
+                $font.Italic = $Italic
+            }
+            else {
+                $fontType = $font.GetType().FullName
+                $detail = "The font object type '$fontType' does not expose an Italic property."
+                throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $detail)
+            }
+        }
+        catch {
+            $message = "Failed to set the font italicization while processing the '$section' section. $($_.Exception.Message)"
+            throw (New-Object -TypeName System.Management.Automation.RuntimeException -ArgumentList $message)
+        }
+    }
 }
 
 # Function to write an header2
@@ -993,17 +1087,20 @@ function Get-AnalyticsCustomDetectionAnalysis {
         }
 
         ### ENTITY MAPPING ANALYSIS
-        Write-Host "RULE: $($rule.properties.displayName)"
+        $ruleDisplayName = $rule.properties.displayName
+        Set-CurrentReportSection -Name ("Rule '{0}' report output" -f $ruleDisplayName)
+        Write-Host "RULE: $ruleDisplayName"
         if ($reportRequested) {
             Set-WriterStyle -Writer $Writer -Bold $true
             $Writer.TypeText("Rule ")
             Set-WriterStyle -Writer $Writer -Bold $false
             Set-WriterStyle -Writer $Writer -Italic $true -Bold $true
-            $Writer.TypeText($rule.properties.displayName)
+            $Writer.TypeText($ruleDisplayName)
             Set-WriterStyle -Writer $Writer -Italic $false -Bold $false
             $Writer.TypeParagraph()
         }
         Write-Host ""
+        Set-CurrentReportSection -Name ("Entity Mapping Analysis for rule '{0}'" -f $ruleDisplayName)
         Write-Host "- Entity Mapping Analysis"
         if ($reportRequested) {
             $Writer.Range.ListFormat.ApplyBulletDefault()
@@ -1060,11 +1157,12 @@ function Get-AnalyticsCustomDetectionAnalysis {
         if ($reportRequested) {
             $Writer.TypeParagraph()
         }
-        
-        
-        
+
+
+
 
         ### ALERT DETAILS OVERRIDE ANALYSIS
+        Set-CurrentReportSection -Name ("Alert Details Override Analysis for rule '{0}'" -f $ruleDisplayName)
         Write-Host "- Alert Details Override Analysis"
         if ($reportRequested) {
             Set-WriterStyle -Writer $Writer -Bold $true
@@ -1121,6 +1219,7 @@ function Get-AnalyticsCustomDetectionAnalysis {
         }
 
         ### INCIDENT RE-OPENING ANALYSIS
+        Set-CurrentReportSection -Name ("Incident Re-Opening Analysis for rule '{0}'" -f $ruleDisplayName)
         Write-Host "- Incident Re-Opening Analysis"
         if ($reportRequested) {
             Set-WriterStyle -Writer $Writer -Bold $true
@@ -1153,6 +1252,7 @@ function Get-AnalyticsCustomDetectionAnalysis {
         }
 
         ### SUPPRESSION ANALYSIS
+        Set-CurrentReportSection -Name ("Suppression Analysis for rule '{0}'" -f $ruleDisplayName)
         Write-Host "- Suppression Analysis"
         if ($reportRequested) {
             Set-WriterStyle -Writer $Writer -Bold $true
@@ -1185,6 +1285,7 @@ function Get-AnalyticsCustomDetectionAnalysis {
         }
 
         ### THRESHOLD ANALYSIS
+        Set-CurrentReportSection -Name ("Threshold Analysis for rule '{0}'" -f $ruleDisplayName)
         Write-Host "- Threshold Analysis"
         if ($reportRequested) {
             Set-WriterStyle -Writer $Writer -Bold $true
@@ -1205,6 +1306,7 @@ function Get-AnalyticsCustomDetectionAnalysis {
         }
 
         ### LOOKBACK ANALYSIS
+        Set-CurrentReportSection -Name ("Lookback Analysis for rule '{0}'" -f $ruleDisplayName)
         Write-Host "- Lookback Analysis"
         if ($reportRequested) {
             Set-WriterStyle -Writer $Writer -Bold $true
@@ -1258,6 +1360,7 @@ function Get-AnalyticsCustomDetectionAnalysis {
         }
         ### NRT ANALYSIS
         if ($rule.kind -eq "NRT") {
+            Set-CurrentReportSection -Name ("NRT Rules Analysis for rule '{0}'" -f $ruleDisplayName)
             Write-Host "- NRT rules Analysis"
             if ($reportRequested) {
                 $Writer.TypeParagraph()
@@ -1296,6 +1399,7 @@ function Add-IntroToReport {
         [array]$environments
     )
 
+    Set-CurrentReportSection -Name 'Report introduction'
     $Writer.Style = 'Heading 1'
     $Writer.TypeText("Defender Adoption Helper Overview")
     $Writer.TypeParagraph()
@@ -1644,6 +1748,7 @@ if ($reportRequested) {
     Set-Variable -Scope Script -Name WordApplication -Value $WordApplication
     Set-Variable -Scope Script -Name Document -Value $Document
     Set-Variable -Scope Script -Name Writer -Value $Writer
+    Set-CurrentReportSection -Name 'Report initialization'
 
     # Insert Table of Contents at the beginning
     $null = $Writer.HomeKey(6) # Move to start of document (wdStory)
@@ -1671,6 +1776,7 @@ foreach ($env in $environments) {
     $workspaceId = $env.WorkspaceId
     $script:currentWorkspaceId = $workspaceId
     write-Host "Starting the analysis for $workspaceName (RG: $resourceGroupName) in subscription $subscriptionId" -ForegroundColor Cyan
+    Set-CurrentReportSection -Name ("Environment summary for workspace '{0}'" -f $workspaceName)
     if ($reportRequested) {
         Write-Heading2 -Writer $Writer -HeadingText "$workspaceName"
         $Writer.Style = 'Normal'
