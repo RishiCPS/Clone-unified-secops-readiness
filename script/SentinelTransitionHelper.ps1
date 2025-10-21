@@ -285,11 +285,25 @@ function Set-UniversalDefenderFlags {
         return
     }
 
-    foreach ($tableName in $DefenderTables) {
-        if ($Universal.ContainsKey($tableName)) {
-            $entry = $Universal[$tableName]
-            if ($entry -is [System.Collections.IDictionary]) {
-                $entry['IsDefenderTable'] = $true
+    $defenderSet = $null
+
+    if ($DefenderTables -and $DefenderTables.Count -gt 0) {
+        $defenderSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($tableName in $DefenderTables) {
+            if (-not [string]::IsNullOrWhiteSpace($tableName)) {
+                $null = $defenderSet.Add($tableName)
+            }
+        }
+    }
+
+    foreach ($tableName in @($Universal.Keys)) {
+        $entry = $Universal[$tableName]
+        if ($entry -is [System.Collections.IDictionary]) {
+            if ($defenderSet) {
+                $entry['IsDefenderTable'] = $defenderSet.Contains($tableName)
+            }
+            else {
+                $entry['IsDefenderTable'] = $false
             }
         }
     }
@@ -510,7 +524,7 @@ function Save-ReportAndCleanup {
 function Get-AnalysisDefenderData {
     param (
         [Parameter(Mandatory = $true)]
-        $defenderTables,
+        [hashtable]$Universal,
         [Parameter(Mandatory = $false)]
         $Writer
     )
@@ -518,11 +532,26 @@ function Get-AnalysisDefenderData {
     $totalControlsTemp = 0
     $passedControlsTemp = 0
     $apiVersion = "2025-02-01"
-    foreach ($table in $defenderTables) {
+
+    if (-not $Universal -or $Universal.Keys.Count -eq 0) {
+        return $totalControlsTemp, $passedControlsTemp
+    }
+
+    foreach ($table in @($Universal.Keys)) {
         $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName/providers/Microsoft.OperationalInsights/workspaces/$workspaceName/tables/${table}?api-version=$apiVersion"
-        $response = Invoke-SentinelApi -Uri $uri
+        Write-Host "Invoking GET $uri"
+
+        try {
+            $response = Invoke-SentinelApi -Uri $uri -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Failed to retrieve data for table $table — $($_.Exception.Message)"
+            continue
+        }
+
         $retentionPeriod = $response.properties.totalRetentionInDays
         $plan = $response.properties.plan
+
         if ($plan) {
             if ($plan -is [string]) {
                 $planDisplay = $plan
@@ -535,33 +564,15 @@ function Get-AnalysisDefenderData {
             $planDisplay = 'Unknown'
         }
 
-        if ($script:universalTable -is [hashtable]) {
-            if ($script:universalTable.ContainsKey($table)) {
-                $entry = $script:universalTable[$table]
-                if ($entry -is [System.Collections.IDictionary]) {
-                    $entry['RetentionDays'] = $retentionPeriod
-                    $entry['Plan'] = $planDisplay
-                    $entry['IsDefenderTable'] = $true
-                }
-            }
-            else {
-                $script:universalTable[$table] = [ordered]@{
-                    TableName       = $table
-                    Billable_90d    = $null
-                    LastSeen        = $null
-                    GB_90           = [double]0
-                    GB_30_from90    = [double]0
-                    RetentionDays   = $retentionPeriod
-                    Plan            = $planDisplay
-                    IsDefenderTable = $true
-                    Tier            = $null
-                    Notes           = $null
-                }
-            }
+        $entry = $Universal[$table]
+        if ($entry -is [System.Collections.IDictionary]) {
+            $entry['RetentionDays'] = $retentionPeriod
+            $entry['Plan'] = $plan
         }
+
         $totalControlsTemp = $totalControlsTemp + 1
 
-        if ($response.properties.totalRetentionInDays -lt 31) {
+        if ($retentionPeriod -lt 31) {
             Write-Host "[WARNING]" -ForegroundColor DarkYellow -NoNewline; Write-Host " The table $table (plan: $planDisplay) has a retention of $retentionPeriod days - no need to ingest this data in Sentinel"
             if ($reportRequested) {
                 Set-WriterStyle -Writer $Writer -Color 255 -Bold $true
@@ -592,6 +603,7 @@ function Get-AnalysisDefenderData {
             }
         }
     }
+
     return $totalControlsTemp, $passedControlsTemp
 }
 
@@ -1638,7 +1650,7 @@ foreach ($env in $environments) {
 
     Show-HeaderInShell -Message "DEFENDER DATA ANALYSIS"
     $apiVersion = "2025-02-01"
-    $totalControlsTemp, $passedControlsTemp = Get-AnalysisDefenderData -defenderTables $defenderTables -Writer $Writer
+    $totalControlsTemp, $passedControlsTemp = Get-AnalysisDefenderData -Universal $universal -Writer $Writer
     $totalControls = $totalControls + $totalControlsTemp
     $totalPassedControls = $totalPassedControls + $passedControlsTemp
 
