@@ -717,7 +717,7 @@ function Get-AnalysisDefenderData {
 
         Write-Host $statusTag -ForegroundColor $statusColor -NoNewline
         Write-Host " $messageBody " -ForegroundColor White -NoNewline
-        Write-Host "↳ " -ForegroundColor White -NoNewline
+        Write-Host "-> " -ForegroundColor White -NoNewline
         Write-Host "IsDefenderTable: " -ForegroundColor Cyan -NoNewline
         Write-Host "$isDefenderDisplay " -ForegroundColor White -NoNewline
         Write-Host "| " -ForegroundColor White -NoNewline
